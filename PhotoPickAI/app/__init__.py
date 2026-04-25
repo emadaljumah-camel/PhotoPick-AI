@@ -1,0 +1,1 @@
+"""PhotoPick AI application package."""
