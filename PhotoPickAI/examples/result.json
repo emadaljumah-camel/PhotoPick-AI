@@ -1,0 +1,17 @@
+{
+  "job_id": "example",
+  "status": "completed",
+  "groups": [
+    {
+      "group_id": "group_001",
+      "photos": ["photo_001", "photo_002", "photo_003"],
+      "representatives": ["photo_002"],
+      "rejected": ["photo_001", "photo_003"],
+      "reason": "photo_002 has the best sharpness, cleaner composition, stronger subject visibility, and fewer distractions.",
+      "confidence": 0.91
+    }
+  ],
+  "ungrouped": [],
+  "skipped": [],
+  "errors": []
+}

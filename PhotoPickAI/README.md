@@ -1,212 +1,216 @@
 # PhotoPick AI
 
-PhotoPick AI is a local Windows desktop MVP for reviewing near-duplicate JPG/JPEG photos in a single folder. It scans one folder, extracts metadata, generates cached previews, groups very similar photos, and lets you choose the preferred image from each group.
+PhotoPick AI is a local Windows desktop app for reviewing JPG/JPEG bursts, exact duplicates, and near-duplicate photo sets. It scans a folder, reads metadata, builds cached previews, groups related images, suggests likely keepers, and can move reviewed originals into `Selected Photos` and `Rejected Photos`.
 
-## MVP Features
+Everything runs locally by default. Metadata extraction, preview generation, similarity analysis, grouping, and manual review happen on your machine. Optional Vision LLM review can call a local LM Studio or Ollama-compatible endpoint using cached preview images.
 
-- Scans only the selected folder, not subfolders
-- Reads EXIF metadata with ExifTool when available
-- Falls back to file modified time when capture time is missing
-- Generates cached preview JPGs for fast review
-- Computes local similarity using a compact visual vector, perceptual hash, file-size similarity, and sharpness score
-- Builds conservative duplicate/burst groups from a similarity graph, with unmatched photos kept as single-photo groups
-- Suggests a default winner based on sharpness, file size, and capture time
-- Restores reviewed and skipped state for saved folders
-- Provides a PySide6 review UI with cached thumbnails and keyboard shortcuts
-- Provides optional local Vision LLM review through LM Studio or Ollama-compatible localhost APIs
-- Provides a `Run Vision LLM All` button after grouping
-- Provides a `Process Photos` automation button that reuses existing groups/selections when available, then moves originals into selected/rejected folders
-- Saves grouping and review results to JSON and CSV
+## Features
 
-## Project Structure
+- Scan JPG/JPEG files in a selected folder
+- Read EXIF metadata with ExifTool when available
+- Fall back to Pillow and file modified time when EXIF data is missing
+- Generate cached preview JPGs for faster repeat reviews
+- Group exact duplicates, near-duplicates, burst candidates, and single photos
+- Score similarity with perceptual hashes, visual descriptors, edge/focus descriptors, file-size similarity, and capture-time proximity
+- Suggest a default keeper from sharpness, file size, and capture time
+- Resume saved grouping and review state for previously scanned folders
+- Review manually with keyboard shortcuts and support for multiple keepers
+- Run optional Vision LLM review for one group or all groups
+- Process the full folder by saving decisions and moving originals
+- Export review results to JSON and CSV
 
-```text
-PhotoPickAI/
-  app/
-    main.py
-    config.py
-    core/
-      scanner.py
-      metadata_reader.py
-      preview_generator.py
-      similarity_engine.py
-      duplicate_grouper.py
-      sharpness.py
-      review_store.py
-      models.py
-    ui/
-      main_window.py
-      duplicate_review_widget.py
-      group_list_panel.py
-      preview_grid.py
-      settings_panel.py
-    utils/
-      file_utils.py
-      time_utils.py
-      json_utils.py
-  workspace/
-    cache/
-      previews/
-      metadata/
-      similarity/
-      review/
-  requirements.txt
-  README.md
-```
+## Requirements
+
+- Windows
+- Python 3.11 or newer
+- Optional: ExifTool on `PATH` for stronger metadata extraction
+- Optional: LM Studio or an Ollama-compatible local vision model endpoint
+
+Python packages are listed in [requirements.txt](requirements.txt):
+
+- PySide6
+- Pillow
+- OpenCV
+- NumPy
 
 ## Setup
 
-1. Install Python 3.11 or newer on Windows.
-2. Optional but recommended: install ExifTool and add it to your `PATH`.
-3. Create and activate a virtual environment.
-4. Install dependencies:
+From the repository root:
 
 ```powershell
+cd PhotoPickAI
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+```
+
+If PowerShell blocks virtual environment activation, allow local scripts for the current user:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
 ## Run
 
-From the `PhotoPickAI` directory:
+From the repository root, you can use:
+
+```powershell
+.\run_app.bat
+```
+
+Or run the app directly from the `PhotoPickAI` directory:
 
 ```powershell
 python -m app.main
 ```
 
-## Workflow
+The app creates its `workspace` folders automatically on startup.
 
-1. Click `Select Folder` and choose one folder containing JPG/JPEG files.
+## Basic Workflow
+
+1. Click `Select Folder` and choose a folder containing JPG/JPEG files.
 2. Click `Find Similar Photos`.
-3. Wait for metadata extraction, preview generation, and grouping to finish.
-4. Click `Run Vision LLM All` to let the local vision model select keepers, or manually review each group.
-5. Click `Process Photos` to move selected originals to `Selected Photos` and the remaining originals to `Rejected Photos`.
-6. Review decisions are saved automatically.
+3. Review each group manually, or click `Run Vision LLM All` if you have a local vision endpoint configured.
+4. Confirm, skip, or choose one or more keepers for each group.
+5. Click `Process Photos` only when you are ready for the app to move original files.
 
-## Process Photos Automation
+Manual review saves decisions but does not move, rename, delete, or modify original photos.
 
-`Process Photos` is the automated workflow. It:
+## Process Photos
 
-- Uses already loaded groups if `Find Similar Photos` has already been run
-- Runs the same scan/grouping flow as `Find Similar Photos` only when no groups are loaded
-- Runs `Run Vision LLM All` behavior only for groups that do not already have a selection
-- Automatically selects one-photo groups without sending them to the Vision LLM
-- Saves review decisions to JSON and CSV
-- Moves selected original files into `Selected Photos`
-- Moves non-selected original files into `Rejected Photos`
-- Assigns every JPG/JPEG in the selected folder to a group, including one-photo groups
+`Process Photos` is the automated finishing workflow. It shows a confirmation dialog because it moves original files.
 
-This button intentionally moves original files. The manual `Find Similar Photos` review workflow does not move originals.
+It will:
+
+- Use already loaded groups when available
+- Scan and group the selected folder first when no groups are loaded
+- Run Vision LLM review only for multi-photo groups that still need a selection
+- Automatically select single-photo groups
+- Save review decisions to JSON and CSV
+- Move selected originals into `Selected Photos`
+- Move non-selected originals into `Rejected Photos`
+- Skip unsafe, missing, or already-moved source files
+
+The destination folders are created inside the selected photo folder. If a destination filename already exists, the app appends a numeric suffix such as `_001`.
 
 ## Optional Vision LLM
 
-PhotoPick AI can ask a local Vision LLM to inspect a group and recommend which photos to keep. This is optional and uses an LM Studio local endpoint by default:
+PhotoPick AI can ask a local Vision LLM to split broad burst groups into visual subgroups and choose one representative photo from each subgroup.
+
+Default endpoint:
 
 ```text
 http://127.0.0.1:1234/v1/chat/completions
 ```
 
-Default model name:
+Default model:
 
 ```text
 qwen2.5-vl-7b-instruct
 ```
 
-Install and run a local vision model separately, then update the endpoint/model in `Settings` if needed. The Vision LLM path sends cached preview images only to the configured local endpoint.
+For LM Studio, load a vision-capable model, start the local server, and keep the `/v1/chat/completions` endpoint. Ollama-style `/api/chat` endpoints are also supported. You can update the endpoint, model name, and timeout in `Settings`.
 
-For LM Studio, load a vision-capable model such as `Qwen2.5-VL-7B-Instruct`, start the local server, and use the `/v1/chat/completions` endpoint. Ollama-style `/api/chat` endpoints are also supported.
+Only cached preview images are sent to the configured endpoint. Original files are not uploaded by PhotoPick AI.
+
+## Lightroom Classic Integration
+
+PhotoPick AI also includes a Lightroom Classic client workflow through a local server. The Lightroom plugin exports resized JPEG previews, sends only those previews to the server, receives group decisions, validates the result, and then applies Lightroom pick/reject flags.
+
+See [README_Lightroom_Server.md](README_Lightroom_Server.md) for setup and troubleshooting.
+
+The Lightroom summary lists each group, the picked photo, and all photos in that group:
+
+```text
+G001_01
+Picked: DSC_1235.NEF
+Photos:
+  DSC_1234.NEF
+  DSC_1235.NEF
+```
+
+The summary uses original Lightroom filenames when Lightroom provides them. Preview JPEGs are named from the original filename stem, such as `DSC_1234.jpg`, while original files are not uploaded or modified.
 
 ## Keyboard Shortcuts
 
 - `1..9`: pick that image in the current group
 - `Enter`: confirm current group
 - `S`: skip current group
-- `K`: pick the suggested winner
-- `V`: run local Vision LLM on the current group
+- `K`: pick the suggested keeper
+- `V`: run Vision LLM for the current group
 - `Right Arrow`: next group
 - `Left Arrow`: previous group
 
+Use `Keep multiple` when a group contains more than one photo worth keeping.
+
+## Project Structure
+
+```text
+PhotoPick-AI/
+  run_app.bat
+  PhotoPickAI/
+    app/
+      main.py
+      config.py
+      core/
+        duplicate_grouper.py
+        local_ai_reviewer.py
+        metadata_reader.py
+        models.py
+        photo_mover.py
+        preview_generator.py
+        review_store.py
+        scanner.py
+        sharpness.py
+        similarity_engine.py
+        vision_llm_reviewer.py
+      ui/
+        duplicate_review_widget.py
+        group_list_panel.py
+        main_window.py
+        preview_grid.py
+        settings_panel.py
+      utils/
+        file_utils.py
+        json_utils.py
+        time_utils.py
+    workspace/
+      cache/
+        metadata/
+        previews/
+        review/
+        similarity/
+      settings.json
+    requirements.txt
+    README.md
+```
+
+`workspace/settings.json` is created after settings are saved.
+
 ## Output Files
 
-PhotoPick AI writes caches and review data under `workspace/cache/`:
+PhotoPick AI writes cache and review files under `workspace/cache/`:
 
 - `previews/<folder-key>/`: cached preview JPGs
-- `metadata/<folder-key>.json`: scanned metadata manifest
-- `similarity/<folder-key>_groups.json`: duplicate groups
+- `metadata/<folder-key>.json`: scanned image metadata
+- `similarity/<folder-key>_groups.json`: grouped photos and analysis state
 - `review/<folder-key>_review.json`: review decisions
 - `review/<folder-key>_review.csv`: review decisions in CSV form
 
-When using manual review, original photos are not moved, renamed, deleted, or modified. When using `Process Photos`, reviewed originals are moved into `Selected Photos` and `Rejected Photos` subfolders inside the selected folder.
+Folder keys are derived from the selected folder path, so the same folder can be resumed later with `Resume Saved Review`.
 
-## JSON Schemas Used
+## Troubleshooting
 
-Metadata cache example:
-
-```json
-{
-  "images": [
-    {
-      "id": "17a6f0d99b7c",
-      "filename": "DSC_4213.jpg",
-      "path": "H:/Photos/DSC_4213.jpg",
-      "file_size": 3812451,
-      "width": 6000,
-      "height": 4000,
-      "orientation": "landscape",
-      "capture_time": "2026-04-23T14:22:03",
-      "preview_path": "H:/Projects/PhotoPick-AI/PhotoPickAI/workspace/cache/previews/abc123/17a6f0d99b7c.jpg",
-      "phash": "010101...",
-      "sharpness_score": 114.24,
-      "similarity_vector": [],
-      "modified_time": "2026-04-23T14:22:09",
-      "group_id": null
-    }
-  ]
-}
-```
-
-Grouping result example:
-
-```json
-{
-  "groups": [
-    {
-      "group_id": "G001",
-      "images": [],
-      "capture_span_seconds": 3,
-      "avg_similarity": 0.9574,
-      "suggested_best": "DSC_4213.jpg",
-      "user_selected": [],
-      "status": "Pending"
-    }
-  ]
-}
-```
-
-Review decision example:
-
-```json
-{
-  "decisions": [
-    {
-      "group_id": "G014",
-      "winner": "DSC_4213.jpg",
-      "alternates": [],
-      "rejected": [
-        "DSC_4211.jpg",
-        "DSC_4212.jpg",
-        "DSC_4214.jpg"
-      ],
-      "reviewed": true,
-      "status": "Reviewed"
-    }
-  ]
-}
-```
+- If no capture time is found, file modified time is used.
+- If ExifTool is not installed, the app still runs with Pillow and file metadata.
+- If Vision LLM review fails, `Process Photos` falls back to the local suggested keeper for that group.
+- If groups look too broad, lower the time windows or raise the similarity threshold in `Settings`.
+- If groups look too fragmented, raise the time windows or lower the similarity threshold in `Settings`.
+- If you moved photos with `Process Photos`, review the `Selected Photos` and `Rejected Photos` folders inside the selected source folder.
 
 ## Notes
 
-- ExifTool is optional; the app handles its absence gracefully.
-- Similarity is intentionally optimized for local near-duplicates and burst shots, not full semantic scene understanding.
-- Thresholds are intentionally conservative to avoid over-grouping different compositions.
-- Similarity computation uses cached previews for speed; winner selection remains fully local.
-- This is Feature 1 only: local grouping and manual review.
+- The similarity system is optimized for local bursts and near-duplicates, not full semantic photo organization.
+- Thresholds are intentionally conservative to reduce accidental grouping of different compositions.
+- Similarity computation uses cached previews for speed; sharpness scoring reads the original file.
+- Vision LLM review is optional and depends on the model quality, context window, and endpoint configuration.

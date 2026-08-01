@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
+Image.MAX_IMAGE_PIXELS = 300_000_000  # 300 MP limit
 
 from app.utils.time_utils import parse_capture_time, to_iso_string
 

@@ -24,12 +24,16 @@ dist/
 .env
 .env.*
 PhotoPickAI/workspace/settings.json
+PhotoPickAI/photopickai_server_config.yaml
 
 # PhotoPick AI runtime/generated data
 PhotoPickAI/workspace/cache/**
 !PhotoPickAI/workspace/cache/**/
 !PhotoPickAI/workspace/cache/**/.gitkeep
 PhotoPickAI/workspace/snapshots/
+PhotoPickAI/server/jobs/
+PhotoPickAI/server/logs/
+PhotoPickAI/server/__pycache__/
 
 # User photo folders / moved output folders
 Sample Photos/

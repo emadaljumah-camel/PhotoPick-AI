@@ -1,0 +1,28 @@
+{
+  "client": "lightroom",
+  "plugin_version": "1.0.0",
+  "settings": {
+    "preview_long_edge": 1600,
+    "auto_reject_non_selected": true
+  },
+  "photos": [
+    {
+      "photo_id": "photo_001",
+      "original_path": "D:/Photos/DSC_0001.NEF",
+      "filename": "DSC_0001.NEF",
+      "capture_time": "2026-05-29T10:30:00",
+      "rating": 3,
+      "color_label": "red",
+      "current_pick_status": "unflagged",
+      "preview_filename": "photo_001.jpg",
+      "exif": {
+        "iso": 400,
+        "shutter_speed": "1/500",
+        "aperture": "f/5.6",
+        "focal_length": "70mm",
+        "camera": "Nikon Z7 II",
+        "lens": ""
+      }
+    }
+  ]
+}
