@@ -21,6 +21,7 @@ class JobPhoto(BaseModel):
     color_label: str | None = ""
     current_pick_status: str | None = "unflagged"
     preview_filename: str
+    preview_sha256: str | None = None
     exif: JobExif = Field(default_factory=JobExif)
 
 
@@ -47,6 +48,7 @@ class Progress(BaseModel):
     stage: str = "created"
     processed_groups: int = 0
     total_groups: int = 0
+    current_group_id: str | None = None
 
 
 class PhotoGroup(BaseModel):
