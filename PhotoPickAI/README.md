@@ -115,11 +115,11 @@ Only cached preview images are sent to the configured endpoint. Original files a
 
 ## Lightroom Classic Integration
 
-PhotoPick AI also includes a Lightroom Classic client workflow through a local server. The Lightroom plugin exports resized JPEG previews, sends only those previews to the server, receives group decisions, validates the result, and then applies Lightroom pick/reject flags.
+PhotoPick AI also includes an asynchronous Lightroom Classic workflow through a local server. The Lightroom plugin exports resized JPEG previews, submits them, and returns after the server queues the job. `PhotoPickAI: Check Job Status / Apply Results` later reports progress, resumes interrupted work, or validates and applies the completed pick/reject decisions.
 
 See [README_Lightroom_Server.md](README_Lightroom_Server.md) for setup and troubleshooting.
 
-The Lightroom summary lists each group, the picked photo, and all photos in that group:
+Small-job summaries list each group, the picked photo, and all photos in that group. Large-job dialogs are compact; their full report is retained in the local job's `completed_result.json`:
 
 ```text
 G001_01

@@ -112,7 +112,7 @@ def create_lightroom_run(root: Path, name: str, job_id: str, reverse: bool = Fal
     return folder
 
 
-def helper_command(folder: Path, port: int) -> list[str]:
+def helper_command(folder: Path, port: int, action: str) -> list[str]:
     return [
         sys.executable,
         str(PROJECT_ROOT / "client_helper" / "lr_client_helper.py"),
@@ -126,10 +126,8 @@ def helper_command(folder: Path, port: int) -> list[str]:
         str(folder / "result.json"),
         "--timeout",
         "2",
-        "--poll-interval",
-        "0.2",
-        "--max-poll-attempts",
-        "100",
+        "--action",
+        action,
     ]
 
 
@@ -158,7 +156,7 @@ def main() -> int:
         second_server: multiprocessing.Process | None = None
         try:
             wait_for_health(port)
-            first_helper = subprocess.Popen(helper_command(first_folder, port), cwd=PROJECT_ROOT)
+            first_helper = subprocess.Popen(helper_command(first_folder, port, "submit"), cwd=PROJECT_ROOT)
             checkpoint = jobs_dir / "manual-run-one" / "checkpoint.json"
             deadline = time.monotonic() + 25
             while time.monotonic() < deadline:
@@ -173,7 +171,6 @@ def main() -> int:
             uploads_before_restart = line_count(upload_log)
             first_server.terminate()
             first_server.join(10)
-            first_helper.terminate()
             first_helper.wait(10)
 
             second_server = multiprocessing.Process(
@@ -182,7 +179,20 @@ def main() -> int:
             )
             second_server.start()
             wait_for_health(port)
-            completed = subprocess.run(helper_command(second_folder, port), cwd=PROJECT_ROOT, timeout=40, check=False)
+            submitted = subprocess.run(
+                helper_command(second_folder, port, "submit"), cwd=PROJECT_ROOT, timeout=10, check=False
+            )
+            deadline = time.monotonic() + 40
+            completed = submitted
+            while submitted.returncode == 0 and time.monotonic() < deadline:
+                time.sleep(0.2)
+                completed = subprocess.run(
+                    helper_command(second_folder, port, "check"), cwd=PROJECT_ROOT, timeout=10, check=False
+                )
+                if completed.returncode == 0:
+                    current = json.loads((second_folder / "result.json").read_text(encoding="utf-8"))
+                    if current.get("status") == "completed":
+                        break
 
             result = json.loads((second_folder / "result.json").read_text(encoding="utf-8"))
             state = json.loads((second_folder / "job_state.json").read_text(encoding="utf-8"))

@@ -321,6 +321,28 @@ class ResumeJobTests(unittest.TestCase):
         self.assertEqual(self.store.get_result(job_id)["status"], "completed")
         self.assertIs(JobStore.save_result, original_save_result)
 
+    def test_completed_job_reports_all_review_groups_processed(self) -> None:
+        job_id = self.create(self.request(count=2))
+        groups = self.groups(count=2)
+
+        self.run_process_with(
+            job_id,
+            groups,
+            lambda group, records: self.decision(group),
+        )
+
+        status = self.store.get_status(job_id)
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(
+            status["progress"],
+            {
+                "stage": "completed",
+                "processed_groups": 2,
+                "total_groups": 2,
+                "current_group_id": None,
+            },
+        )
+
     def test_duplicate_run_requests_queue_only_once(self) -> None:
         job_id = self.create(self.request(count=1))
         background = CapturingBackgroundTasks()
@@ -391,6 +413,8 @@ class ResumeJobTests(unittest.TestCase):
     def test_server_restart_treats_valid_result_as_authoritative(self) -> None:
         job_id = self.create(self.request(count=1))
         group = self.groups(count=1)[0]
+        self.store.save_groups(job_id, [group], [])
+        self.store.save_group_checkpoint(job_id, group, self.decision(group))
         self.store.save_result(JobResult(job_id=job_id, status="completed", groups=self.decision(group)))
         self.store.set_status(job_id, "running", Progress(stage="vision_review", processed_groups=1, total_groups=1))
 
@@ -399,6 +423,8 @@ class ResumeJobTests(unittest.TestCase):
         self.assertEqual(interrupted, [])
         self.assertEqual(status["status"], "completed")
         self.assertFalse(status["resumable"])
+        self.assertEqual(status["progress"]["processed_groups"], 1)
+        self.assertEqual(status["progress"]["total_groups"], 1)
 
     def test_server_restart_marks_invalid_completed_result_failed(self) -> None:
         job_id = self.create(self.request(count=1))

@@ -163,25 +163,44 @@ class SimilarityEngine:
             if progress_callback:
                 progress_callback(index, total, f"Extracted features for {record.filename}")
 
-        sorted_records = sorted(records, key=lambda item: item.capture_datetime)
+        sorted_records = sorted(
+            records,
+            key=lambda item: (
+                0 if not item.capture_time else 1,
+                item.capture_datetime,
+                item.filename,
+            ),
+        )
         matched_edges: list[tuple[str, str, float, str]] = []
         window_seconds = self.settings.comparison_time_window_seconds
         total_pairs = max(1, len(sorted_records))
-        candidate_scores: dict[tuple[str, str], tuple[float, float, int, float, float, float]] = {}
+        candidate_scores: dict[
+            tuple[str, str],
+            tuple[float, float, int, float | None, float, float],
+        ] = {}
 
         for left_index, left in enumerate(sorted_records):
             left_vector = np.asarray(left.similarity_vector, dtype=np.float32)
             left_focus = np.asarray(left.focus_vector, dtype=np.float32)
             left_edge = np.asarray(left.edge_vector, dtype=np.float32)
             for right in sorted_records[left_index + 1 :]:
-                delta = abs((right.capture_datetime - left.capture_datetime).total_seconds())
-                if delta > window_seconds:
+                capture_times_known = bool(left.capture_time and right.capture_time)
+                delta = (
+                    abs((right.capture_datetime - left.capture_datetime).total_seconds())
+                    if capture_times_known
+                    else None
+                )
+                if delta is not None and delta > window_seconds:
                     break
                 if self.settings.same_orientation_preference and left.orientation != right.orientation:
                     continue
-                ratio_gap = 0.0
-                if left.aspect_ratio and right.aspect_ratio:
-                    ratio_gap = abs(left.aspect_ratio - right.aspect_ratio)
+                left_ratio = self._comparison_aspect_ratio(left)
+                right_ratio = self._comparison_aspect_ratio(right)
+                ratio_gap = (
+                    abs(left_ratio - right_ratio)
+                    if left_ratio and right_ratio
+                    else 0.0
+                )
                 right_vector = np.asarray(right.similarity_vector, dtype=np.float32)
                 right_focus = np.asarray(right.focus_vector, dtype=np.float32)
                 right_edge = np.asarray(right.edge_vector, dtype=np.float32)
@@ -190,7 +209,7 @@ class SimilarityEngine:
                 edge_similarity = cosine_similarity(left_edge, right_edge)
                 hash_distance = hamming_distance(left.phash, right.phash)
                 size_similarity = self._size_similarity(left, right)
-                time_factor = self._time_factor(delta, window_seconds)
+                time_factor = self._time_factor(delta, window_seconds) if delta is not None else 0.0
                 similarity_score = self._combine_similarity(
                     visual_similarity,
                     focus_similarity,
@@ -306,6 +325,16 @@ class SimilarityEngine:
         larger = max(left.file_size, right.file_size)
         return float(smaller / larger) if larger else 0.0
 
+    def _comparison_aspect_ratio(self, record: ImageRecord) -> float:
+        """Return orientation-aware or orientation-neutral aspect ratio."""
+
+        ratio = record.aspect_ratio
+        if not ratio:
+            return 0.0
+        if self.settings.same_orientation_preference:
+            return ratio
+        return max(ratio, 1.0 / ratio)
+
     def _time_factor(self, delta_seconds: float, window_seconds: int) -> float:
         if window_seconds <= 0:
             return 0.0
@@ -325,7 +354,10 @@ class SimilarityEngine:
     def _bridge_sequence_neighbors(
         self,
         sorted_records: list[ImageRecord],
-        candidate_scores: dict[tuple[str, str], tuple[float, float, int, float, float, float]],
+        candidate_scores: dict[
+            tuple[str, str],
+            tuple[float, float, int, float | None, float, float],
+        ],
     ) -> list[tuple[str, str, float, str]]:
         """Bridge near-in-time burst neighbors when both sides are moderately similar."""
 
@@ -344,6 +376,8 @@ class SimilarityEngine:
 
             left_score, left_visual, left_hash, left_delta, _, _ = candidate_scores[left_key]
             right_score, right_visual, right_hash, right_delta, _, _ = candidate_scores[right_key]
+            if left_delta is None or right_delta is None:
+                continue
             if (
                 left_delta <= self.settings.comparison_time_window_seconds
                 and right_delta <= self.settings.comparison_time_window_seconds
@@ -360,7 +394,10 @@ class SimilarityEngine:
     def _burst_candidate_edges(
         self,
         sorted_records: list[ImageRecord],
-        candidate_scores: dict[tuple[str, str], tuple[float, float, int, float, float, float]],
+        candidate_scores: dict[
+            tuple[str, str],
+            tuple[float, float, int, float | None, float, float],
+        ],
     ) -> list[tuple[str, str, float, str]]:
         """Add looser same-moment burst candidate edges."""
 
@@ -375,6 +412,8 @@ class SimilarityEngine:
                 if key not in candidate_scores:
                     continue
                 score, visual_or_focus, hash_distance, delta, ratio_gap, size_similarity = candidate_scores[key]
+                if delta is None:
+                    continue
                 if delta > burst_window:
                     break
                 if self.settings.same_orientation_preference and left.orientation != right.orientation:
@@ -405,6 +444,8 @@ class SimilarityEngine:
             return burst_edges
 
         for left, right in zip(sorted_records, sorted_records[1:]):
+            if not left.capture_time or not right.capture_time:
+                continue
             delta = abs((right.capture_datetime - left.capture_datetime).total_seconds())
             if delta > sequence_window:
                 continue
@@ -418,9 +459,13 @@ class SimilarityEngine:
         return burst_edges
 
     def _reasonable_burst_sequence(self, left: ImageRecord, right: ImageRecord) -> bool:
-        ratio_gap = 0.0
-        if left.aspect_ratio and right.aspect_ratio:
-            ratio_gap = abs(left.aspect_ratio - right.aspect_ratio)
+        left_ratio = self._comparison_aspect_ratio(left)
+        right_ratio = self._comparison_aspect_ratio(right)
+        ratio_gap = (
+            abs(left_ratio - right_ratio)
+            if left_ratio and right_ratio
+            else 0.0
+        )
         if ratio_gap > 0.65:
             return False
 

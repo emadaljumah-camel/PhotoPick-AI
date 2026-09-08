@@ -60,7 +60,14 @@ class DuplicateGrouper:
                 component_ids.append(current)
                 stack.extend(neighbor for neighbor in adjacency[current] if neighbor not in visited)
 
-            component_images = sorted((records_by_id[item_id] for item_id in component_ids), key=lambda item: item.capture_datetime)
+            component_images = sorted(
+                (records_by_id[item_id] for item_id in component_ids),
+                key=lambda item: (
+                    0 if item.capture_time else 1,
+                    item.capture_datetime,
+                    item.filename,
+                ),
+            )
             image_chunks = self._split_large_component(component_images)
             for images in image_chunks:
                 chunk_ids = {image.id for image in images}
@@ -88,9 +95,16 @@ class DuplicateGrouper:
         similarities: list[float],
         component_edge_types: set[str],
     ) -> None:
-        start_time = images[0].capture_datetime
-        end_time = images[-1].capture_datetime
-        span = int(abs((end_time - start_time).total_seconds()))
+        known_times = [
+            image.capture_datetime
+            for image in images
+            if image.capture_time
+        ]
+        span = (
+            int(abs((max(known_times) - min(known_times)).total_seconds()))
+            if len(known_times) > 1
+            else 0
+        )
         group_id = f"G{len(groups) + 1:03d}"
         group_key = self._build_group_key(images)
         if len(images) == 1:
@@ -133,12 +147,30 @@ class DuplicateGrouper:
                 continue
 
             previous = current[-1]
-            gap = abs((image.capture_datetime - previous.capture_datetime).total_seconds())
-            span_if_added = abs((image.capture_datetime - current[0].capture_datetime).total_seconds())
+            time_gap_too_large = False
+            if previous.capture_time and image.capture_time:
+                gap = abs((image.capture_datetime - previous.capture_datetime).total_seconds())
+                time_gap_too_large = gap > max_gap_seconds
+
+            known_times_if_added = [
+                item.capture_datetime
+                for item in [*current, image]
+                if item.capture_time
+            ]
+            time_span_too_large = (
+                len(known_times_if_added) > 1
+                and abs(
+                    (
+                        max(known_times_if_added)
+                        - min(known_times_if_added)
+                    ).total_seconds()
+                )
+                > max_span_seconds
+            )
             should_split = (
                 len(current) >= max_images_per_group
-                or gap > max_gap_seconds
-                or span_if_added > max_span_seconds
+                or time_gap_too_large
+                or time_span_too_large
             )
 
             if should_split:

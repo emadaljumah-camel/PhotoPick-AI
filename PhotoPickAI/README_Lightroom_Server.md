@@ -11,23 +11,24 @@ This adds a Lightroom Classic client workflow without changing the existing Phot
 - Source client helper: `D:\Projects\PhotoPick-AI\PhotoPickAI\client_helper\lr_client_helper.py`
 - Config: `D:\Projects\PhotoPick-AI\PhotoPickAI\photopickai_server_config.yaml`
 
-The Lightroom plugin exports resized JPEG previews, writes `job.json`, runs the Python helper, reads `result.json`, validates it, and only then applies Lightroom pick/reject flags.
+The Lightroom plugin exports resized JPEG previews, submits the job, and immediately returns after the server queues it. Use `PhotoPickAI: Check Job Status / Apply Results` later to inspect progress, resume an interrupted job, or validate and apply a completed result.
 
 Preview files are named from the original Lightroom filename when Lightroom exposes it. For example, `DSC_1234.NEF` is exported as `DSC_1234.jpg` for server review. The original filename is also written to `job.json` and used in the Lightroom summary dialog.
 
 ## Resumable Jobs
 
-Long Lightroom jobs are checkpointed on both the Lightroom computer and the server. If the helper times out, Lightroom closes, the network disconnects, or the server restarts, completed work is retained.
+Long Lightroom jobs are checkpointed on both the Lightroom computer and the server. Lightroom does not remain blocked while Vision processing runs. If Lightroom closes, the network disconnects, or the server restarts, completed work is retained.
 
 To resume:
 
 1. Restart the PhotoPickAI server if it is not running.
-2. In Lightroom, select the same photos with the same processing settings.
-3. Run `PhotoPickAI: Pick Best Among Similar Photos` again.
+2. Open the original Lightroom catalog.
+3. Run `PhotoPickAI: Check Job Status / Apply Results`.
+4. Choose `Resume Job` when Lightroom reports an interrupted or resumable failure.
 
-The helper calculates a fingerprint of the selection, settings, processing metadata, and preview SHA-256 hashes. Photo order does not affect the fingerprint. It stores the server job ID in `job_state.json` inside the local job folder and in `.resume/<fingerprint>.json` under the configured Lightroom temporary-job root. A fresh Lightroom job folder can therefore reconnect to the earlier server job. The helper compares server and local preview hashes, uploads only missing or mismatched previews, and safely calls the idempotent run endpoint.
+The helper calculates a fingerprint of the selection, processing settings, and preview SHA-256 hashes. Photo order does not affect the fingerprint. It stores the server job ID in `job_state.json` inside the local job folder and in `.resume/<fingerprint>.json` under the configured Lightroom temporary-job root. Incomplete submissions reconnect to the earlier server job, compare server and local hashes, upload only missing or mismatched previews, and safely call the idempotent run endpoint. A deliberate submission after a completed job creates a fresh job so model or prompt changes can produce a new decision.
 
-Do not delete the Lightroom temporary-job root or `server/jobs/<job-id>` while a job may need recovery. A completed result is reused when the same selection fingerprint is run again. Changes to the selection, metadata represented in the manifest, or processing settings create a different fingerprint and therefore a new job.
+Do not delete the Lightroom temporary-job root or `server/jobs/<job-id>` while a job may need recovery. Downloaded completions are also preserved locally as `completed_result.json`, allowing Lightroom to retry flag application without rerunning Vision.
 
 The server job directory contains:
 
@@ -67,12 +68,13 @@ curl http://100.108.139.62:8080/photopick/health
 1. Open Lightroom Classic.
 2. Go to `File > Plug-in Manager`.
 3. Add `D:\Projects\PhotoPick-AI\LRPhotoPickAI.lrdevplugin\PhotoPickAI_BestPicker.lrdevplugin` for development, or unzip `dist\PhotoPickAI_BestPicker.lrdevplugin.zip` and add the unzipped `PhotoPickAI_BestPicker.lrdevplugin` folder for deployment.
-4. Set `Server URL` to `http://100.108.139.62:8080/photopick`.
-5. Run `Library > Plug-in Extras > PhotoPickAI: Pick Best Among Similar Photos`.
+4. Set `Server URL` to `http://localhost:8080/photopick` for the installed local service, or enter the remote server URL used by your deployment.
+5. Run `Library > Plug-in Extras > PhotoPickAI: Submit Selected Photos`.
+6. Later, run `PhotoPickAI: Check Job Status / Apply Results`.
 
-Defaults are stored with Lightroom plugin preferences. Dry run is enabled by default.
+Defaults are stored with Lightroom plugin preferences. New installs use 1024-pixel JPEG previews at quality 85. Dry run is disabled by default.
 
-Fresh deployment installs default to `http://100.108.139.62:8080/photopick` and the helper script bundled inside the `.lrdevplugin` folder. If an older install still shows local development paths, click `Reset to Default Values` in the plugin settings or update the fields manually.
+Fresh installs default to `http://localhost:8080/photopick` and the helper script bundled inside the `.lrdevplugin` folder. Existing Lightroom preferences are preserved until `Reset to Default Values` is clicked.
 
 ## Network Setup
 
@@ -119,7 +121,7 @@ Dry run does not change Lightroom flags. It shows the same group summary that a 
 
 ## Lightroom Summary
 
-After validation, Lightroom shows a summary dialog with counts and group membership. The summary does not include AI reasons or confidence scores.
+After validation, Lightroom shows a summary dialog with counts and group membership. For large jobs, the dialog shows the first 20 groups and first 20 photos per displayed group; `completed_result.json` retains the complete report. The summary does not include AI reasons or confidence scores.
 
 Example:
 
@@ -152,8 +154,8 @@ The `Picked:` line names the photo selected for that group. The `Photos:` list s
 
 - Server unreachable: confirm `/health`, IP address, firewall, and `server_url`.
 - Wrong API key: confirm the plugin and server values match.
-- Timeout: increase `timeout_seconds` or `max_poll_attempts`.
-- Interrupted long job: leave both job directories intact, restart the server if necessary, select the same photos, and run the Lightroom command again.
+- Network timeout: increase `timeout_seconds` if an individual upload or status request cannot complete.
+- Interrupted long job: leave both job directories intact, restart the server if necessary, and use `PhotoPickAI: Check Job Status / Apply Results` to resume it.
 - HTTP 409 when creating a job: the same job ID was reused with a different manifest. Preserve the old job for recovery or start with a genuinely new job ID.
 - Missing preview: Lightroom skipped an export; check `plugin.log` under the temp job root.
 - Generated-looking names in the summary, such as `photo_0001_260.jpg`, mean Lightroom did not expose the original filename for that photo during export/manifest creation. Check the source file path and Lightroom file metadata.

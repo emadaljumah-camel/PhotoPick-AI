@@ -5,15 +5,11 @@ local LrPathUtils = import "LrPathUtils"
 local ExportPreviews = {}
 
 local function getRawMetadata(photo, key)
-    local ok, value = pcall(function() return photo:getRawMetadata(key) end)
-    if ok then return value end
-    return nil
+    return photo:getRawMetadata(key)
 end
 
 local function getFormattedMetadata(photo, key)
-    local ok, value = pcall(function() return photo:getFormattedMetadata(key) end)
-    if ok then return value end
-    return nil
+    return photo:getFormattedMetadata(key)
 end
 
 local function getOriginalFilename(photo)
@@ -68,7 +64,7 @@ function ExportPreviews.export(photos, previewFolder, settings, logger, progress
         LR_size_maxWidth = settings.preview_long_edge,
         LR_size_resizeType = "longEdge",
         LR_outputSharpeningOn = false,
-        LR_minimizeEmbeddedMetadata = true,
+        LR_minimizeEmbeddedMetadata = false,
         LR_collisionHandling = "overwrite",
     }
 
@@ -103,7 +99,6 @@ function ExportPreviews.export(photos, previewFolder, settings, logger, progress
                 preview_filename = previewName,
                 preview_path = finalPath,
             }
-            logger.log("Exported preview " .. finalPath)
         else
             table.insert(skipped, { photo_id = photoId, error = tostring(pathOrMessage) })
             logger.log("Preview export failed for " .. photoId .. ": " .. tostring(pathOrMessage))
@@ -114,6 +109,11 @@ function ExportPreviews.export(photos, previewFolder, settings, logger, progress
         progressScope:setCaption("Finished exporting previews.")
         progressScope:setPortionComplete(#photos, math.max(#photos, 1))
     end
+    logger.log(
+        "Preview export complete exported=" .. tostring(#photos - #skipped)
+            .. " skipped=" .. tostring(#skipped)
+            .. " folder=" .. previewFolder
+    )
 
     return exported, skipped
 end

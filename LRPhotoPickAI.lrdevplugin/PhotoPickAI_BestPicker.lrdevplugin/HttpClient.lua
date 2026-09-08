@@ -10,7 +10,7 @@ local function quote(value)
     return '"' .. value:gsub('"', '\\"') .. '"'
 end
 
-function HttpClient.buildCommand(settings, jobJsonPath, previewFolder, resultJsonPath)
+function HttpClient.buildCommand(settings, jobJsonPath, previewFolder, resultJsonPath, action)
     local parts = {
         quote(settings.helper_python),
         quote(settings.helper_script),
@@ -19,8 +19,7 @@ function HttpClient.buildCommand(settings, jobJsonPath, previewFolder, resultJso
         "--preview-folder", quote(previewFolder),
         "--result-json", quote(resultJsonPath),
         "--timeout", quote(settings.timeout_seconds),
-        "--poll-interval", quote(settings.poll_interval_seconds),
-        "--max-poll-attempts", quote(settings.max_poll_attempts),
+        "--action", quote(action or "submit"),
     }
     if settings.api_key and settings.api_key ~= "" then
         table.insert(parts, "--api-key")
@@ -29,8 +28,8 @@ function HttpClient.buildCommand(settings, jobJsonPath, previewFolder, resultJso
     return table.concat(parts, " ")
 end
 
-function HttpClient.runHelper(settings, jobJsonPath, previewFolder, resultJsonPath)
-    return LrTasks.execute(HttpClient.buildCommand(settings, jobJsonPath, previewFolder, resultJsonPath))
+function HttpClient.runHelper(settings, jobJsonPath, previewFolder, resultJsonPath, action)
+    return LrTasks.execute(HttpClient.buildCommand(settings, jobJsonPath, previewFolder, resultJsonPath, action))
 end
 
 return HttpClient

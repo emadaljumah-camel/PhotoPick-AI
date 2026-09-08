@@ -4,9 +4,10 @@ import base64
 import io
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,22 @@ class VisionLLMReviewResult:
     reason: str
     subgroups: list[dict[str, Any]]
     raw_response: str = ""
+    raw_responses: list[str] = field(default_factory=list)
+    parsed_subgroups: list[dict[str, Any]] = field(default_factory=list)
+    photo_observations: list[dict[str, Any]] = field(default_factory=list)
+    adjacent_transitions: list[dict[str, Any]] = field(default_factory=list)
+    reconciliation_comparisons: list[dict[str, Any]] = field(default_factory=list)
+    winner_comparisons: list[dict[str, Any]] = field(default_factory=list)
+    semantic_contract_version: str = "group-partition-v1"
+    attempts: int = 1
+    semantic_fallback: bool = False
+    validation_errors: list[str] = field(default_factory=list)
+
+
+class SemanticReviewAttemptError(RuntimeError):
+    def __init__(self, message: str, raw_response: str = "") -> None:
+        super().__init__(message)
+        self.raw_response = raw_response
 
 
 class VisionLLMReviewer:
@@ -35,176 +52,955 @@ class VisionLLMReviewer:
 
     SUBGROUP_RETRY_CHUNK_SIZE = 6
 
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(
+        self,
+        settings: AppSettings,
+        allow_subgroups: bool = True,
+        retry_model_json_once: bool = True,
+    ) -> None:
         self.settings = settings
+        self.allow_subgroups = allow_subgroups
+        self.retry_model_json_once = retry_model_json_once
 
     def review_group(self, group: DuplicateGroup) -> VisionLLMReviewResult:
-        """Ask the local Vision LLM to split a group, then select one keeper per subgroup."""
+        """Partition one broad group and select its keepers in one Vision call."""
 
         if not group.images:
             return VisionLLMReviewResult([], "No images in group", [])
 
-        try:
-            selected_filenames, final_subgroups, raw_responses = self._review_image_set(
-                group.images,
-                context_name=group.group_id,
+        if len(group.images) == 1:
+            image = group.images[0]
+            subgroup = {
+                "name": "Singleton",
+                "main_subject": "Single photograph",
+                "images": [image.filename],
+                "representative": image.filename,
+                "reason": "Single photograph kept.",
+            }
+            return VisionLLMReviewResult(
+                selected_filenames=[image.filename],
+                reason="Single photograph kept.",
+                subgroups=[subgroup],
+                parsed_subgroups=[subgroup],
+                attempts=0,
             )
-            reason = (
-                f"Vision LLM created {len(final_subgroups)} subgroup(s), "
-                "then selected one representative from each subgroup."
-            )
-        except RuntimeError as exc:
-            if not self._is_retryable_subgroup_failure(exc):
-                raise
 
-            if len(group.images) > 1:
-                selected_filenames, final_subgroups, raw_responses = self._review_large_group_in_chunks(
-                    group.images,
-                    original_error=exc,
-                )
-                if self._is_context_window_failure(exc):
-                    reason = (
-                        "Full-group Vision request exceeded the model context window, so the app retried the group "
-                        f"in smaller chunks of up to {self.SUBGROUP_RETRY_CHUNK_SIZE} photos and combined the chunk selections."
-                    )
-                else:
-                    reason = (
-                        "Full-group Vision subgrouping returned invalid JSON, so the app retried the group in smaller "
-                        f"chunks of up to {self.SUBGROUP_RETRY_CHUNK_SIZE} photos and combined the chunk selections."
-                    )
-            else:
-                selected_filenames, final_subgroups, raw_responses = self._single_image_fallback_subgroups(
-                    group.images,
-                    reason=f"Vision subgrouping failed: {exc}",
-                )
-                reason = (
-                    "Vision subgrouping failed for this single-photo group, so the photo was kept "
-                    "to avoid rejecting distinct images."
-                )
+        raw_responses: list[str] = []
+        validation_errors: list[str] = []
+        maximum_attempts = 2 if self.retry_model_json_once else 1
 
-        result = VisionLLMReviewResult(
-            selected_filenames=selected_filenames,
-            reason=reason,
-            subgroups=final_subgroups,
-            raw_response="\n\n---\n\n".join(raw_responses),
+        LOGGER.info(
+            "semantic_contract_version=group-partition-v1 broad_group_id=%s "
+            "allow_subgroups=%s ordered_input_photo_ids=%s",
+            group.group_id,
+            self.allow_subgroups,
+            [image.id for image in group.images],
         )
-        LOGGER.info("Vision LLM selected %s for %s", result.selected_filenames, group.group_id)
-        return result
+
+        for attempt in range(1, maximum_attempts + 1):
+            try:
+                (
+                    selected_filenames,
+                    subgroups,
+                    raw_response,
+                    parsed_subgroups,
+                    photo_observations,
+                    adjacent_transitions,
+                ) = self._semantic_review_attempt(
+                    group.images,
+                    context_name=group.group_id,
+                )
+                raw_responses.append(self._safe_response_content(raw_response))
+                LOGGER.info(
+                    "semantic_group_valid contract=group-partition-v1 "
+                    "broad_group_id=%s attempt=%s subgroups=%s selected=%s",
+                    group.group_id,
+                    attempt,
+                    len(subgroups),
+                    selected_filenames,
+                )
+                return VisionLLMReviewResult(
+                    selected_filenames=selected_filenames,
+                    reason=(
+                        f"Group-level semantic review created {len(subgroups)} "
+                        "visual subgroup(s)."
+                    ),
+                    subgroups=subgroups,
+                    raw_response=raw_responses[-1],
+                    raw_responses=raw_responses,
+                    parsed_subgroups=parsed_subgroups,
+                    photo_observations=photo_observations,
+                    adjacent_transitions=adjacent_transitions,
+                    attempts=attempt,
+                    validation_errors=validation_errors,
+                )
+            except Exception as exc:
+                validation_errors.append(str(exc))
+                failed_raw = getattr(exc, "raw_response", "")
+                if failed_raw:
+                    raw_responses.append(self._safe_response_content(failed_raw))
+                LOGGER.warning(
+                    "semantic_group_validation_failure "
+                    "contract=group-partition-v1 broad_group_id=%s "
+                    "attempt=%s/%s error=%s",
+                    group.group_id,
+                    attempt,
+                    maximum_attempts,
+                    exc,
+                )
+
+        last_error = RuntimeError(validation_errors[-1])
+        context_failure = any(
+            self._is_context_window_failure(RuntimeError(error))
+            for error in validation_errors
+        )
+        if context_failure and len(group.images) > self.SUBGROUP_RETRY_CHUNK_SIZE:
+            (
+                selected_filenames,
+                subgroups,
+                chunk_raw,
+                chunk_attempts,
+            ) = self._review_large_group_in_chunks(group.images, last_error)
+            all_raw = [*raw_responses, *chunk_raw]
+            LOGGER.warning(
+                "semantic_group_chunk_fallback contract=group-partition-v1 "
+                "broad_group_id=%s chunks=%s",
+                group.group_id,
+                len(self._chunks(group.images, self.SUBGROUP_RETRY_CHUNK_SIZE)),
+            )
+            return VisionLLMReviewResult(
+                selected_filenames=selected_filenames,
+                reason="Full-group review exceeded context; contiguous chunks were reviewed.",
+                subgroups=subgroups,
+                raw_response=all_raw[-1] if all_raw else "",
+                raw_responses=all_raw,
+                parsed_subgroups=subgroups,
+                attempts=maximum_attempts + chunk_attempts,
+                validation_errors=validation_errors,
+            )
+
+        selected_filenames, subgroups, fallback_raw = (
+            self._single_image_fallback_subgroups(
+                group.images,
+                reason="Group-level Vision review failed; every photo was kept.",
+            )
+        )
+        LOGGER.error(
+            "semantic_group_fallback=singletons contract=group-partition-v1 "
+            "broad_group_id=%s attempts=%s errors=%s",
+            group.group_id,
+            maximum_attempts,
+            validation_errors,
+        )
+        return VisionLLMReviewResult(
+            selected_filenames=selected_filenames,
+            reason="Vision review failed; every photo was retained.",
+            subgroups=subgroups,
+            raw_response=fallback_raw[-1],
+            raw_responses=[*raw_responses, *fallback_raw],
+            parsed_subgroups=subgroups,
+            attempts=maximum_attempts,
+            semantic_fallback=True,
+            validation_errors=validation_errors,
+        )
+
+    def _review_adjacent_pair_with_retry(
+        self,
+        source: ImageRecord,
+        target: ImageRecord,
+        context_name: str,
+    ) -> tuple[dict[str, Any], list[str], list[str], int]:
+        maximum_attempts = 2 if self.retry_model_json_once else 1
+        raw_responses: list[str] = []
+        validation_errors: list[str] = []
+
+        for attempt in range(1, maximum_attempts + 1):
+            LOGGER.info(
+                "semantic_pair_attempt contract=pairwise-graph-v2 context=%s "
+                "from_photo_id=%s to_photo_id=%s attempt=%s/%s",
+                context_name,
+                source.id,
+                target.id,
+                attempt,
+                maximum_attempts,
+            )
+            raw_response = ""
+            try:
+                raw_response = self._post_json(
+                    self._build_payload(
+                        self._build_adjacent_pair_prompt(
+                            source,
+                            target,
+                            context_name,
+                        ),
+                        self._pair_image_inputs(source, target),
+                    )
+                )
+                raw_responses.append(self._safe_response_content(raw_response))
+                transition = self._parse_adjacent_pair_response(
+                    raw_response,
+                    source.filename,
+                    target.filename,
+                )
+                transition.update(
+                    {
+                        "attempts": attempt,
+                        "fallback": False,
+                        "validation_errors": list(validation_errors),
+                    }
+                )
+                return transition, raw_responses, validation_errors, attempt
+            except Exception as exc:
+                if raw_response and (
+                    not raw_responses
+                    or raw_responses[-1] != self._safe_response_content(raw_response)
+                ):
+                    raw_responses.append(self._safe_response_content(raw_response))
+                validation_errors.append(str(exc))
+                LOGGER.warning(
+                    "semantic_pair_validation_failure contract=pairwise-graph-v2 "
+                    "context=%s attempt=%s/%s error=%s",
+                    context_name,
+                    attempt,
+                    maximum_attempts,
+                    exc,
+                )
+
+        reason = (
+            "Pair comparison failed after all configured attempts; "
+            "a fail-open subgroup boundary was created."
+        )
+        LOGGER.error(
+            "semantic_pair_fallback=separate contract=pairwise-graph-v2 context=%s "
+            "from_photo_id=%s to_photo_id=%s attempts=%s errors=%s",
+            context_name,
+            source.id,
+            target.id,
+            maximum_attempts,
+            validation_errors,
+        )
+        return (
+            {
+                "from": source.filename,
+                "to": target.filename,
+                "same_best_frame_decision": False,
+                "reason": reason,
+                "photo_observations": [],
+                "attempts": maximum_attempts,
+                "fallback": True,
+                "validation_errors": validation_errors,
+            },
+            raw_responses,
+            validation_errors,
+            maximum_attempts,
+        )
+
+    def _select_representative_pairwise(
+        self,
+        images: list[ImageRecord],
+        context_name: str,
+    ) -> tuple[str, list[dict[str, Any]], list[str], list[str], int]:
+        champion = images[0]
+        comparisons: list[dict[str, Any]] = []
+        raw_responses: list[str] = []
+        validation_errors: list[str] = []
+        total_attempts = 0
+
+        for comparison_index, challenger in enumerate(images[1:], start=1):
+            (
+                comparison,
+                comparison_raw,
+                comparison_errors,
+                attempts,
+            ) = self._review_winner_pair_with_retry(
+                champion,
+                challenger,
+                context_name=f"{context_name} winner comparison {comparison_index}",
+            )
+            comparisons.append(comparison)
+            raw_responses.extend(comparison_raw)
+            validation_errors.extend(comparison_errors)
+            total_attempts += attempts
+            if comparison["winner"] == challenger.filename:
+                champion = challenger
+
+        return (
+            champion.filename,
+            comparisons,
+            raw_responses,
+            validation_errors,
+            total_attempts,
+        )
+
+    def _review_winner_pair_with_retry(
+        self,
+        first: ImageRecord,
+        second: ImageRecord,
+        context_name: str,
+    ) -> tuple[dict[str, Any], list[str], list[str], int]:
+        maximum_attempts = 2 if self.retry_model_json_once else 1
+        raw_responses: list[str] = []
+        validation_errors: list[str] = []
+
+        for attempt in range(1, maximum_attempts + 1):
+            raw_response = ""
+            try:
+                raw_response = self._post_json(
+                    self._build_payload(
+                        self._build_winner_pair_prompt(
+                            first,
+                            second,
+                            context_name,
+                        ),
+                        self._pair_image_inputs(first, second),
+                    )
+                )
+                raw_responses.append(self._safe_response_content(raw_response))
+                comparison = self._parse_winner_pair_response(
+                    raw_response,
+                    first.filename,
+                    second.filename,
+                )
+                comparison.update(
+                    {
+                        "attempts": attempt,
+                        "fallback": False,
+                        "validation_errors": list(validation_errors),
+                    }
+                )
+                return comparison, raw_responses, validation_errors, attempt
+            except Exception as exc:
+                if raw_response and (
+                    not raw_responses
+                    or raw_responses[-1] != self._safe_response_content(raw_response)
+                ):
+                    raw_responses.append(self._safe_response_content(raw_response))
+                validation_errors.append(str(exc))
+                LOGGER.warning(
+                    "semantic_winner_validation_failure contract=pairwise-graph-v2 "
+                    "context=%s attempt=%s/%s error=%s",
+                    context_name,
+                    attempt,
+                    maximum_attempts,
+                    exc,
+                )
+
+        winner = max(
+            (first, second),
+            key=lambda image: image.sharpness_score,
+        )
+        comparison = {
+            "candidate_a": first.filename,
+            "candidate_b": second.filename,
+            "winner": winner.filename,
+            "reason": (
+                "Winner comparison failed after all configured attempts; "
+                "local sharpness selected the fallback winner."
+            ),
+            "photo_observations": [],
+            "attempts": maximum_attempts,
+            "fallback": True,
+            "validation_errors": validation_errors,
+        }
+        LOGGER.error(
+            "semantic_winner_fallback=local_sharpness contract=pairwise-graph-v2 "
+            "context=%s winner=%s attempts=%s errors=%s",
+            context_name,
+            winner.filename,
+            maximum_attempts,
+            validation_errors,
+        )
+        return comparison, raw_responses, validation_errors, maximum_attempts
+
+    def _reconcile_semantic_components(
+        self,
+        components: list[list[ImageRecord]],
+        reviewed_pairs: set[frozenset[str]],
+        context_name: str,
+    ) -> tuple[
+        list[list[ImageRecord]],
+        list[dict[str, Any]],
+        list[str],
+        list[str],
+        int,
+    ]:
+        """Merge separated components when new cross-component evidence agrees."""
+
+        components = [list(component) for component in components]
+        comparisons: list[dict[str, Any]] = []
+        raw_responses: list[str] = []
+        validation_errors: list[str] = []
+        total_attempts = 0
+        input_order = {
+            image.filename: index
+            for index, image in enumerate(
+                image
+                for component in components
+                for image in component
+            )
+        }
+
+        while len(components) > 1:
+            merged = False
+            for left_index in range(len(components) - 1):
+                for right_index in range(left_index + 1, len(components)):
+                    candidate = self._strongest_untested_cross_pair(
+                        components[left_index],
+                        components[right_index],
+                        reviewed_pairs,
+                    )
+                    if candidate is None:
+                        continue
+
+                    source, target, local_score = candidate
+                    pair_key = frozenset((source.filename, target.filename))
+                    reviewed_pairs.add(pair_key)
+                    transition, pair_raw, pair_errors, attempts = (
+                        self._review_adjacent_pair_with_retry(
+                            source,
+                            target,
+                            context_name=(
+                                f"{context_name} reconciliation "
+                                f"{left_index + 1}-{right_index + 1}"
+                            ),
+                        )
+                    )
+                    comparison = {
+                        "left_component": [
+                            image.filename for image in components[left_index]
+                        ],
+                        "right_component": [
+                            image.filename for image in components[right_index]
+                        ],
+                        "candidate_a": source.filename,
+                        "candidate_b": target.filename,
+                        "local_similarity": local_score,
+                        "same_best_frame_decision": transition[
+                            "same_best_frame_decision"
+                        ],
+                        "reason": transition["reason"],
+                        "photo_observations": transition.get(
+                            "photo_observations",
+                            [],
+                        ),
+                        "attempts": transition.get("attempts", attempts),
+                        "fallback": transition.get("fallback", False),
+                        "validation_errors": transition.get(
+                            "validation_errors",
+                            [],
+                        ),
+                    }
+                    comparisons.append(comparison)
+                    raw_responses.extend(pair_raw)
+                    validation_errors.extend(pair_errors)
+                    total_attempts += attempts
+
+                    if transition["same_best_frame_decision"]:
+                        combined = (
+                            components[left_index] + components[right_index]
+                        )
+                        combined.sort(
+                            key=lambda image: input_order[image.filename]
+                        )
+                        components[left_index] = combined
+                        del components[right_index]
+                        merged = True
+                        LOGGER.info(
+                            "semantic_component_merge contract=pairwise-graph-v2 "
+                            "context=%s candidate_a=%s candidate_b=%s "
+                            "local_similarity=%.4f",
+                            context_name,
+                            source.filename,
+                            target.filename,
+                            local_score,
+                        )
+                        break
+                if merged:
+                    break
+            if not merged:
+                break
+
+        components.sort(
+            key=lambda component: min(
+                input_order[image.filename] for image in component
+            )
+        )
+        return (
+            components,
+            comparisons,
+            raw_responses,
+            validation_errors,
+            total_attempts,
+        )
+
+    def _strongest_untested_cross_pair(
+        self,
+        left_component: list[ImageRecord],
+        right_component: list[ImageRecord],
+        reviewed_pairs: set[frozenset[str]],
+    ) -> tuple[ImageRecord, ImageRecord, float] | None:
+        candidates: list[tuple[float, ImageRecord, ImageRecord]] = []
+        for left in left_component:
+            for right in right_component:
+                pair_key = frozenset((left.filename, right.filename))
+                if pair_key in reviewed_pairs:
+                    continue
+                candidates.append(
+                    (self._local_pair_similarity(left, right), left, right)
+                )
+        if not candidates:
+            return None
+        score, left, right = max(candidates, key=lambda item: item[0])
+        return left, right, score
+
+    def _local_pair_similarity(
+        self,
+        left: ImageRecord,
+        right: ImageRecord,
+    ) -> float:
+        scores: list[float] = []
+        for left_values, right_values in (
+            (left.similarity_vector, right.similarity_vector),
+            (left.focus_vector, right.focus_vector),
+            (left.edge_vector, right.edge_vector),
+        ):
+            left_vector = np.asarray(left_values, dtype=np.float32)
+            right_vector = np.asarray(right_values, dtype=np.float32)
+            if left_vector.size and left_vector.size == right_vector.size:
+                scores.append(cosine_similarity(left_vector, right_vector))
+        return max(scores, default=0.0)
+
+    def _pair_image_inputs(
+        self,
+        first: ImageRecord,
+        second: ImageRecord,
+    ) -> list[tuple[Path, str]]:
+        return [
+            (
+                Path(image.preview_path or image.path),
+                f"{index}. {image.filename} | photo_id={image.id}",
+            )
+            for index, image in enumerate((first, second), start=1)
+        ]
+
+    def _parse_pair_observations(
+        self,
+        payload: dict[str, Any],
+        expected_filenames: list[str],
+    ) -> list[dict[str, str]]:
+        raw_observations = payload.get("photo_observations")
+        if not isinstance(raw_observations, list) or len(raw_observations) != 2:
+            raise RuntimeError(
+                "Vision LLM returned invalid pair JSON: "
+                "photo_observations must contain exactly two entries"
+            )
+
+        observations: list[dict[str, str]] = []
+        for index, (expected_filename, raw_observation) in enumerate(
+            zip(expected_filenames, raw_observations),
+            start=1,
+        ):
+            if not isinstance(raw_observation, dict):
+                raise RuntimeError(
+                    "Vision LLM returned invalid pair JSON: "
+                    f"observation {index} must be an object"
+                )
+            if raw_observation.get("filename") != expected_filename:
+                raise RuntimeError(
+                    "Vision LLM returned invalid pair JSON: "
+                    f"observation {index} must describe {expected_filename}"
+                )
+
+            principal_subject = raw_observation.get("principal_subject")
+            visible_scene = raw_observation.get("visible_scene")
+            if not isinstance(principal_subject, str) or not principal_subject.strip():
+                raise RuntimeError(
+                    "Vision LLM returned invalid pair JSON: "
+                    f"{expected_filename} requires principal_subject"
+                )
+            if not isinstance(visible_scene, str) or not visible_scene.strip():
+                raise RuntimeError(
+                    "Vision LLM returned invalid pair JSON: "
+                    f"{expected_filename} requires visible_scene"
+                )
+            observations.append(
+                {
+                    "filename": expected_filename,
+                    "principal_subject": principal_subject.strip(),
+                    "visible_scene": visible_scene.strip(),
+                }
+            )
+        return observations
+
+    def _parse_adjacent_pair_response(
+        self,
+        raw_response: str,
+        source_filename: str,
+        target_filename: str,
+    ) -> dict[str, Any]:
+        try:
+            payload = json.loads(self._extract_json_text(raw_response))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Vision LLM returned invalid pair JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                "Vision LLM returned invalid pair JSON: top-level value must be an object"
+            )
+
+        observations = self._parse_pair_observations(
+            payload,
+            [source_filename, target_filename],
+        )
+        same_decision = payload.get("same_best_frame_decision")
+        if type(same_decision) is not bool:
+            raise RuntimeError(
+                "Vision LLM returned invalid pair JSON: "
+                "same_best_frame_decision must be a boolean"
+            )
+        reason = payload.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise RuntimeError(
+                "Vision LLM returned invalid pair JSON: reason is required"
+            )
+        return {
+            "from": source_filename,
+            "to": target_filename,
+            "same_best_frame_decision": same_decision,
+            "reason": reason.strip(),
+            "photo_observations": observations,
+        }
+
+    def _parse_winner_pair_response(
+        self,
+        raw_response: str,
+        first_filename: str,
+        second_filename: str,
+    ) -> dict[str, Any]:
+        try:
+            payload = json.loads(self._extract_json_text(raw_response))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Vision LLM returned invalid winner JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                "Vision LLM returned invalid winner JSON: top-level value must be an object"
+            )
+
+        observations = self._parse_pair_observations(
+            payload,
+            [first_filename, second_filename],
+        )
+        winner = payload.get("winner")
+        if winner not in {first_filename, second_filename}:
+            raise RuntimeError(
+                "Vision LLM returned invalid winner JSON: "
+                "winner must be one of the compared photographs"
+            )
+        reason = payload.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise RuntimeError(
+                "Vision LLM returned invalid winner JSON: reason is required"
+            )
+        return {
+            "candidate_a": first_filename,
+            "candidate_b": second_filename,
+            "winner": winner,
+            "reason": reason.strip(),
+            "photo_observations": observations,
+        }
 
     def _review_image_set(
         self,
         images: list[ImageRecord],
         context_name: str,
     ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
-        """Run the two-step Vision flow for one image set."""
+        """Request and validate one semantic partition-and-pick response."""
 
-        filenames = [image.filename for image in images]
-        image_inputs = [(Path(image.preview_path or image.path), f"{index}. {image.filename}") for index, image in enumerate(images, start=1)]
-
-        subgroup_prompt = self._build_subgroup_prompt_for_images(images, context_name)
-        subgroup_raw_response = self._post_json(self._build_payload(subgroup_prompt, image_inputs))
-        subgroups = self._parse_subgroup_response(subgroup_raw_response, filenames)
-        subgroups, pose_refinement_raw_responses = self._refine_pose_sensitive_subgroups(
-            subgroups,
+        selected_filenames, subgroups, raw_response, _, _, _ = self._semantic_review_attempt(
             images,
-            filenames,
             context_name,
         )
+        return selected_filenames, subgroups, [raw_response]
 
-        selected_filenames: list[str] = []
-        final_subgroups: list[dict[str, Any]] = []
-        raw_responses = [subgroup_raw_response, *pose_refinement_raw_responses]
-        images_by_filename = {image.filename: image for image in images}
+    def _semantic_review_attempt(
+        self,
+        images: list[ImageRecord],
+        context_name: str,
+    ) -> tuple[
+        list[str],
+        list[dict[str, Any]],
+        str,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        filenames = [image.filename for image in images]
+        image_inputs = [
+            (
+                Path(image.preview_path or image.path),
+                f"{index}. {image.filename} | photo_id={image.id}",
+            )
+            for index, image in enumerate(images, start=1)
+        ]
+        prompt = self._build_semantic_review_prompt(images, context_name)
+        raw_response = self._post_json(self._build_payload(prompt, image_inputs))
+        try:
+            (
+                subgroups,
+                photo_observations,
+                adjacent_transitions,
+                parsed_subgroups,
+            ) = self._parse_semantic_response(raw_response, filenames)
+        except Exception as exc:
+            raise SemanticReviewAttemptError(str(exc), raw_response) from exc
+        selected_filenames = [subgroup["representative"] for subgroup in subgroups]
+        return (
+            selected_filenames,
+            subgroups,
+            raw_response,
+            parsed_subgroups,
+            photo_observations,
+            adjacent_transitions,
+        )
 
-        for subgroup_index, subgroup in enumerate(subgroups, start=1):
-            subgroup_filenames = [filename for filename in subgroup["images"] if filename in images_by_filename]
-            if not subgroup_filenames:
-                continue
+    def _parse_semantic_response(
+        self,
+        raw_response: str,
+        valid_filenames: list[str],
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        """Validate visual evidence, adjacent decisions, and their partition."""
 
-            if len(subgroup_filenames) == 1:
-                representative = subgroup_filenames[0]
-                selection_reason = "Single-photo subgroup selected automatically."
-            else:
-                subgroup_images = [images_by_filename[filename] for filename in subgroup_filenames]
-                selection_prompt = self._build_selection_prompt(subgroup["name"], subgroup_images)
-                selection_inputs = [
-                    (Path(image.preview_path or image.path), f"{index}. {image.filename}")
-                    for index, image in enumerate(subgroup_images, start=1)
-                ]
-                try:
-                    selection_raw_response = self._post_json(self._build_payload(selection_prompt, selection_inputs))
-                    raw_responses.append(selection_raw_response)
-                    representative, selection_reason = self._parse_selection_response(selection_raw_response, subgroup_filenames)
-                except Exception as exc:
-                    representative = self._best_component_representative(subgroup_images, "")
-                    selection_reason = f"Selection fallback used because the Vision LLM selection call failed: {exc}"
+        subgroups = self._parse_subgroup_response(raw_response, valid_filenames)
+        payload = json.loads(self._extract_json_text(raw_response))
+        valid_set = set(valid_filenames)
 
-            selected_filenames.append(representative)
-            final_subgroups.append(
+        raw_observations = payload.get("photo_observations")
+        if not isinstance(raw_observations, list):
+            raise RuntimeError(
+                "Vision LLM returned invalid semantic JSON: "
+                "photo_observations must be an array"
+            )
+        if len(raw_observations) != len(valid_filenames):
+            raise RuntimeError(
+                "Vision LLM returned invalid semantic JSON: "
+                "photo_observations must contain exactly one entry per photo"
+            )
+
+        observations: list[dict[str, Any]] = []
+        observed_filenames: set[str] = set()
+        for index, raw_observation in enumerate(raw_observations, start=1):
+            if not isinstance(raw_observation, dict):
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: "
+                    f"photo observation {index} must be an object"
+                )
+            filename = raw_observation.get("filename")
+            if not isinstance(filename, str) or filename not in valid_set:
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: "
+                    f"photo observation {index} has an unknown filename"
+                )
+            if filename in observed_filenames:
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: "
+                    f"photo observation repeats {filename}"
+                )
+
+            principal_subject = raw_observation.get("principal_subject")
+            visible_scene = raw_observation.get("visible_scene")
+            if not isinstance(principal_subject, str) or not principal_subject.strip():
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: "
+                    f"photo observation for {filename} requires principal_subject"
+                )
+            if not isinstance(visible_scene, str) or not visible_scene.strip():
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: "
+                    f"photo observation for {filename} requires visible_scene"
+                )
+
+            observed_filenames.add(filename)
+            observations.append(
                 {
-                    "name": subgroup.get("name", f"Subgroup {subgroup_index}"),
-                    "main_subject": subgroup.get("main_subject", ""),
-                    "images": subgroup_filenames,
-                    "representative": representative,
-                    "reason": selection_reason,
+                    "filename": filename,
+                    "principal_subject": principal_subject.strip(),
+                    "visible_scene": visible_scene.strip(),
                 }
             )
 
-        return selected_filenames, final_subgroups, raw_responses
+        missing_observations = valid_set - observed_filenames
+        if missing_observations:
+            raise RuntimeError(
+                "Vision LLM returned invalid semantic JSON: "
+                f"photo observations omitted {sorted(missing_observations)}"
+            )
+
+        expected_pairs = list(zip(valid_filenames, valid_filenames[1:]))
+        raw_transitions = payload.get("adjacent_transitions")
+        if not isinstance(raw_transitions, list):
+            raise RuntimeError(
+                "Vision LLM returned invalid semantic JSON: "
+                "adjacent_transitions must be an array"
+            )
+        if len(raw_transitions) != len(expected_pairs):
+            raise RuntimeError(
+                "Vision LLM returned invalid semantic JSON: "
+                "adjacent_transitions must contain exactly one entry "
+                "for every adjacent input pair"
+            )
+
+        transitions: list[dict[str, Any]] = []
+        for index, ((expected_from, expected_to), raw_transition) in enumerate(
+            zip(expected_pairs, raw_transitions),
+            start=1,
+        ):
+            if not isinstance(raw_transition, dict):
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: "
+                    f"adjacent transition {index} must be an object"
+                )
+
+            source = raw_transition.get("from")
+            target = raw_transition.get("to")
+            if source != expected_from or target != expected_to:
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: "
+                    f"adjacent transition {index} must compare "
+                    f"{expected_from} to {expected_to}"
+                )
+
+            same_decision = raw_transition.get("same_best_frame_decision")
+            if type(same_decision) is not bool:
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: "
+                    f"adjacent transition {expected_from} -> {expected_to} "
+                    "requires a boolean same_best_frame_decision"
+                )
+
+            reason = raw_transition.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: "
+                    f"adjacent transition {expected_from} -> {expected_to} "
+                    "requires a reason"
+                )
+
+            transitions.append(
+                {
+                    "from": source,
+                    "to": target,
+                    "same_best_frame_decision": same_decision,
+                    "reason": reason.strip(),
+                }
+            )
+
+        subgroup_by_filename: dict[str, int] = {}
+        input_position = {
+            filename: index for index, filename in enumerate(valid_filenames)
+        }
+        for subgroup in subgroups:
+            subgroup["images"].sort(key=input_position.__getitem__)
+
+        # Subgroup and member order have no semantic meaning. Normalize the
+        # complete partition to capture order for deterministic downstream IDs.
+        subgroups.sort(
+            key=lambda subgroup: min(
+                input_position[filename] for filename in subgroup["images"]
+            )
+        )
+        for subgroup_index, subgroup in enumerate(subgroups):
+            for filename in subgroup["images"]:
+                subgroup_by_filename[filename] = subgroup_index
+
+        for transition in transitions:
+            same_subgroup = (
+                subgroup_by_filename[transition["from"]]
+                == subgroup_by_filename[transition["to"]]
+            )
+            if transition["same_best_frame_decision"] != same_subgroup:
+                raise RuntimeError(
+                    "Vision LLM returned invalid semantic JSON: transition "
+                    f"{transition['from']} -> {transition['to']} contradicts "
+                    "the returned subgroup partition"
+                )
+
+        return (
+            subgroups,
+            observations,
+            transitions,
+            list(payload.get("subgroups", [])),
+        )
+
+    def _safe_response_content(self, raw_response: str) -> str:
+        without_hidden_reasoning = re.sub(
+            r"<(?:think|analysis)>.*?</(?:think|analysis)>",
+            "",
+            raw_response,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+        return without_hidden_reasoning[:20_000]
 
     def _review_large_group_in_chunks(
         self,
         images: list[ImageRecord],
         original_error: RuntimeError,
-    ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    ) -> tuple[list[str], list[dict[str, Any]], list[str], int]:
         """Retry failed large-group subgrouping in smaller Vision requests."""
 
         selected_filenames: list[str] = []
         final_subgroups: list[dict[str, Any]] = []
         raw_responses = [f"Full group subgrouping failed before chunk retry: {original_error}"]
+        total_attempts = 0
 
         for chunk_index, chunk in enumerate(self._chunks(images, self.SUBGROUP_RETRY_CHUNK_SIZE), start=1):
-            chunk_selected, chunk_subgroups, chunk_raw = self._review_chunk_or_split(
+            chunk_selected, chunk_subgroups, chunk_raw, chunk_attempts = self._review_chunk_or_split(
                 chunk,
                 label=f"Chunk {chunk_index}",
             )
+            total_attempts += chunk_attempts
             for filename in chunk_selected:
                 if filename not in selected_filenames:
                     selected_filenames.append(filename)
             final_subgroups.extend(chunk_subgroups)
             raw_responses.extend(chunk_raw)
 
-        return selected_filenames, final_subgroups, raw_responses
+        return selected_filenames, final_subgroups, raw_responses, total_attempts
 
     def _review_chunk_or_split(
         self,
         images: list[ImageRecord],
         label: str,
-    ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    ) -> tuple[list[str], list[dict[str, Any]], list[str], int]:
         """Review a chunk, splitting again if the local model context is still too small."""
 
         try:
             selected_filenames, subgroups, raw_responses = self._review_image_set(images, context_name=label)
             for subgroup in subgroups:
                 subgroup["name"] = f"{label}: {subgroup.get('name', 'Subgroup')}"
-            return selected_filenames, subgroups, raw_responses
+            return selected_filenames, subgroups, raw_responses, 1
         except RuntimeError as exc:
             if self._is_context_window_failure(exc) and len(images) > 1:
                 midpoint = max(1, len(images) // 2)
                 selected_filenames: list[str] = []
                 subgroups: list[dict[str, Any]] = []
                 raw_responses = [f"{label} exceeded model context and was split into smaller Vision requests: {exc}"]
+                total_attempts = 1
                 for split_index, split in enumerate((images[:midpoint], images[midpoint:]), start=1):
-                    split_selected, split_subgroups, split_raw = self._review_chunk_or_split(
+                    split_selected, split_subgroups, split_raw, split_attempts = self._review_chunk_or_split(
                         split,
                         label=f"{label}.{split_index}",
                     )
+                    total_attempts += split_attempts
                     for filename in split_selected:
                         if filename not in selected_filenames:
                             selected_filenames.append(filename)
                     subgroups.extend(split_subgroups)
                     raw_responses.extend(split_raw)
-                return selected_filenames, subgroups, raw_responses
+                return selected_filenames, subgroups, raw_responses, total_attempts
 
             if self._is_retryable_subgroup_failure(exc):
                 selected_filenames, subgroups, raw_responses = self._single_image_fallback_subgroups(
@@ -213,7 +1009,7 @@ class VisionLLMReviewer:
                 )
                 for subgroup in subgroups:
                     subgroup["name"] = f"{label}: {subgroup.get('name', 'Fallback distinct photo')}"
-                return selected_filenames, subgroups, raw_responses
+                return selected_filenames, subgroups, raw_responses, 1
 
             raise
 
@@ -240,7 +1036,8 @@ class VisionLLMReviewer:
         return [images[index : index + size] for index in range(0, len(images), size)]
 
     def _is_subgroup_json_failure(self, exc: RuntimeError) -> bool:
-        return "invalid subgroup JSON" in str(exc)
+        message = str(exc).lower()
+        return "invalid subgroup json" in message or "invalid semantic json" in message
 
     def _is_context_window_failure(self, exc: RuntimeError) -> bool:
         message = str(exc).lower()
@@ -253,6 +1050,12 @@ class VisionLLMReviewer:
         if self._uses_openai_chat_api():
             content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
             for image_path, label in image_inputs:
+                content.append(
+                    {
+                        "type": "text",
+                        "text": f"The next image is {label}.",
+                    }
+                )
                 content.append(
                     {
                         "type": "image_url",
@@ -345,53 +1148,76 @@ class VisionLLMReviewer:
                 preview = f"{preview[:300]}..."
             raise RuntimeError(f"Vision LLM returned invalid subgroup JSON. Response preview: {preview}") from exc
 
+        if not isinstance(payload, dict):
+            raise RuntimeError("Vision LLM returned invalid subgroup JSON: top-level value must be an object")
+
         raw_subgroups = payload.get("subgroups", [])
-        if not isinstance(raw_subgroups, list):
-            raw_subgroups = []
+        if not isinstance(raw_subgroups, list) or not raw_subgroups:
+            raise RuntimeError("Vision LLM returned invalid subgroup JSON: subgroups must be a non-empty array")
 
         subgroups: list[dict[str, Any]] = []
         assigned: set[str] = set()
+        valid_set = set(valid_filenames)
         for index, raw_subgroup in enumerate(raw_subgroups, start=1):
             if not isinstance(raw_subgroup, dict):
-                continue
+                raise RuntimeError(
+                    f"Vision LLM returned invalid subgroup JSON: subgroup {index} must be an object"
+                )
             images = raw_subgroup.get("images", [])
-            if isinstance(images, str):
-                images = [images]
-            normalized_images = [
-                filename
-                for filename in images
-                if filename in valid_filenames and filename not in assigned
-            ]
-            if not normalized_images:
-                continue
-            assigned.update(normalized_images)
+            if not isinstance(images, list) or not images:
+                raise RuntimeError(
+                    f"Vision LLM returned invalid subgroup JSON: subgroup {index} must contain a non-empty images array"
+                )
+            if any(not isinstance(filename, str) for filename in images):
+                raise RuntimeError(
+                    f"Vision LLM returned invalid subgroup JSON: subgroup {index} contains a non-string photo identifier"
+                )
+            image_set = set(images)
+            if len(image_set) != len(images):
+                raise RuntimeError(
+                    f"Vision LLM returned invalid subgroup JSON: subgroup {index} repeats a photo"
+                )
+            unknown = image_set - valid_set
+            if unknown:
+                raise RuntimeError(
+                    f"Vision LLM returned invalid subgroup JSON: subgroup {index} contains unknown photos {sorted(unknown)}"
+                )
+            repeated = assigned & image_set
+            if repeated:
+                raise RuntimeError(
+                    f"Vision LLM returned invalid subgroup JSON: photos appear in multiple subgroups {sorted(repeated)}"
+                )
+
+            representative = raw_subgroup.get("representative")
+            if not isinstance(representative, str):
+                raise RuntimeError(
+                    f"Vision LLM returned invalid subgroup JSON: subgroup {index} must contain exactly one representative"
+                )
+            if representative not in image_set:
+                raise RuntimeError(
+                    f"Vision LLM returned invalid subgroup JSON: subgroup {index} representative is outside its images"
+                )
+
+            assigned.update(image_set)
             subgroups.append(
                 {
                     "name": str(raw_subgroup.get("name", f"Subgroup {index}")),
                     "main_subject": str(raw_subgroup.get("main_subject", raw_subgroup.get("subject", ""))),
-                    "images": normalized_images,
+                    "images": list(images),
+                    "representative": representative,
                     "reason": str(raw_subgroup.get("reason", "")),
                 }
             )
 
-        for filename in valid_filenames:
-            if filename not in assigned:
-                subgroups.append(
-                    {
-                        "name": "Unassigned distinct photo",
-                        "images": [filename],
-                        "reason": "The subgrouping response omitted this filename, so it was kept separately.",
-                    }
-                )
-
-        if not subgroups and valid_filenames:
-            subgroups = [
-                {
-                    "name": "Fallback subgroup",
-                    "images": valid_filenames,
-                    "reason": "Fallback because no valid subgroups were returned.",
-                }
-            ]
+        missing = valid_set - assigned
+        if missing:
+            raise RuntimeError(
+                f"Vision LLM returned invalid subgroup JSON: response omitted photos {sorted(missing)}"
+            )
+        if not self.allow_subgroups and len(subgroups) != 1:
+            raise RuntimeError(
+                "Vision LLM returned invalid subgroup JSON: subgrouping is disabled but multiple subgroups were returned"
+            )
         return subgroups
 
     def _parse_selection_response(self, raw_response: str, valid_filenames: list[str]) -> tuple[str, str]:
@@ -987,6 +1813,157 @@ class VisionLLMReviewer:
 
     def _build_subgroup_prompt(self, group: DuplicateGroup) -> str:
         return self._build_subgroup_prompt_for_images(group.images, group.group_id)
+
+    def _build_adjacent_pair_prompt(
+        self,
+        source: ImageRecord,
+        target: ImageRecord,
+        context_name: str,
+    ) -> str:
+        return (
+            "Compare exactly two candidate photographs. Determine whether they "
+            "compete for the same best-frame decision.\n\n"
+            f"Context: {context_name}\n"
+            f"Photo 1: {source.filename} | photo_id={source.id}\n"
+            f"Photo 2: {target.filename} | photo_id={target.id}\n\n"
+            "Describe each supplied image independently before deciding. Set "
+            "same_best_frame_decision to false when the principal subject, visible "
+            "scene, or photographic purpose materially changes. Different streets, "
+            "alleys, plazas, buildings, landscapes, or independently useful "
+            "environmental views require false even when captured seconds apart. "
+            "Expression, timing, focus, exposure, and small framing changes remain true "
+            "when the principal subject and scene are otherwise the same.\n\n"
+            "Return only JSON using this exact schema:\n"
+            '{"photo_observations":[{"filename":"first filename",'
+            '"principal_subject":"visible principal subject",'
+            '"visible_scene":"what is visibly shown"},{"filename":"second filename",'
+            '"principal_subject":"visible principal subject",'
+            '"visible_scene":"what is visibly shown"}],'
+            '"same_best_frame_decision":false,'
+            '"reason":"visible evidence for the decision"}'
+        )
+
+    def _build_winner_pair_prompt(
+        self,
+        first: ImageRecord,
+        second: ImageRecord,
+        context_name: str,
+    ) -> str:
+        return (
+            "Compare exactly two photographs that already belong to the same semantic "
+            "subgroup. Select the technically and visually stronger photograph.\n\n"
+            f"Context: {context_name}\n"
+            f"Candidate A: {first.filename} | photo_id={first.id}\n"
+            f"Candidate B: {second.filename} | photo_id={second.id}\n\n"
+            "Describe both images independently, then choose using focus, motion "
+            "quality, timing, expression, exposure, composition, obstruction, and "
+            "overall visual effectiveness.\n\n"
+            "Return only JSON using this exact schema:\n"
+            '{"photo_observations":[{"filename":"first filename",'
+            '"principal_subject":"visible principal subject",'
+            '"visible_scene":"visible quality and composition"},{"filename":"second filename",'
+            '"principal_subject":"visible principal subject",'
+            '"visible_scene":"visible quality and composition"}],'
+            '"winner":"one exact filename","reason":"why it is stronger"}'
+        )
+
+    def _build_semantic_review_prompt(
+        self,
+        images: list[ImageRecord],
+        context_name: str,
+    ) -> str:
+        filenames = "\n".join(
+            f"{index}. {image.filename} | photo_id={image.id}"
+            for index, image in enumerate(images, start=1)
+        )
+        subgroup_mode = (
+            "You may return one or more subgroups."
+            if self.allow_subgroups
+            else "Subgrouping is disabled. Return exactly one subgroup containing every listed photograph."
+        )
+        return (
+            "You are reviewing one broad candidate photo group. Broad groups are intentionally permissive and may "
+            "contain photographs that were captured close together but represent different photographic subjects.\n\n"
+            f"Group: {context_name}\n"
+            f"Allowed filenames:\n{filenames}\n\n"
+            "Each supplied image has a visible label containing the same sequence "
+            "number, filename, and photo ID. Inspect every labeled image individually.\n\n"
+            "Your task is to partition the photographs according to this question:\n"
+            "Which photographs compete for the same best-frame decision?\n\n"
+            f"{subgroup_mode}\n\n"
+            "CONSERVATIVE RETENTION POLICY\n"
+            "Put photographs in the same subgroup only when they are genuinely interchangeable choices for one "
+            "keeper. Sharing the same subject, building, room, location, or capture sequence is not sufficient. "
+            "When uncertain whether two photographs provide independently useful visual coverage, keep them in "
+            "separate subgroups. Prefer retaining an extra representative over rejecting a photograph with distinct "
+            "photographic value.\n\n"
+            "ARCHITECTURE AND VIEWPOINT RULES\n"
+            "For architecture and places, create separate subgroups for materially different facades, corners, "
+            "courtyards, interiors, exteriors, entrances, architectural details, wide establishing views, and "
+            "environmental compositions. Also separate photographs made from materially different camera positions, "
+            "viewing directions, fields of view, or compositions only when they provide materially different subject "
+            "coverage, not merely a different crop or aspect ratio.\n\n"
+            "ORIENTATION AND CROP VARIANT RULES\n"
+            "Landscape and portrait photographs must remain in the same subgroup when they show the same principal "
+            "subject from essentially the same camera position and moment, with strongly overlapping scene content. "
+            "A change of aspect ratio, crop, or field of view does not create independent photographic value merely "
+            "because one frame includes more wall, floor, sky, foreground, or the continuation of a doorway or "
+            "building facade.\n\n"
+            "Separate orientation variants only when one frame contains a materially important subject, action, "
+            "architectural feature, or storytelling element that is absent from the other and gives the viewer a "
+            "genuine reason to retain both. When the difference is primarily framing, the photographs compete for "
+            "one keeper.\n\n"
+            "EVIDENCE AND TRANSITION WORKFLOW\n"
+            "First, write exactly one photo_observations entry for every photograph. "
+            "Describe only the visible principal subject and visible scene in that "
+            "specific labeled image. Do not copy an observation from another image.\n\n"
+            "Second, compare every adjacent pair in the listed order. Return exactly "
+            "one adjacent_transitions entry for each pair. Set "
+            "same_best_frame_decision to false when the pair shows materially different "
+            "principal subjects, scenes, or independently useful photographic "
+            "interpretations. A false transition means that adjacent pair belongs to "
+            "different subgroups, but it does not prevent a later photograph from "
+            "joining an earlier visual subgroup. A true transition requires both "
+            "adjacent photographs to remain in the same subgroup.\n\n"
+            "SUBGROUP CRITERIA\n"
+            "Keep photographs together when they show the same principal subject or subject set and differ mainly "
+            "in expression, gesture, eye direction, pose, walking stride, subject position, timing, focus, exposure, "
+            "motion quality, minor framing, small viewpoint changes, or orientation. These differences affect which "
+            "photo should be picked; they do not independently justify another subgroup.\n\n"
+            "Create separate subgroups when the photographic subject or selection purpose materially changes. Examples "
+            "include a significant principal person, animal, vehicle, or object appearing or disappearing; a material "
+            "change in principal subject identity or category; an independent environmental photograph changing into "
+            "a subject-driven sequence; or the same location supporting independently useful photographic interpretations "
+            "from which a viewer would reasonably retain one image each.\n\n"
+            "When the photographs are genuinely interchangeable, do not split because a tiny or distant incidental "
+            "person appears, a background object changes slightly, a subject moves within the frame, a person turns "
+            "or gestures, focus or exposure changes, portrait and landscape versions show the same principal subject "
+            "with materially equivalent coverage and composition, or one image is technically weaker. These examples "
+            "must not override the conservative retention policy or the architecture and viewpoint rules.\n\n"
+            "Do not identify named people, exact landmarks, or unverified locations.\n\n"
+            "WINNER CRITERIA\n"
+            "After deciding subgroup membership, select exactly one representative from each subgroup. Choose the "
+            "technically and visually strongest photograph using focus, motion quality, expression, gesture, timing, "
+            "exposure, composition, obstruction, and overall visual effectiveness. Winner criteria must not be used "
+            "to create extra subgroups.\n\n"
+            "Return only JSON using this exact schema:\n"
+            '{"photo_observations":[{"filename":"filename.jpg",'
+            '"principal_subject":"specific visible principal subject",'
+            '"visible_scene":"concise description of what is visibly shown"}],'
+            '"adjacent_transitions":[{"from":"earlier filename.jpg",'
+            '"to":"next filename.jpg","same_best_frame_decision":true,'
+            '"reason":"visible evidence supporting same or separate decisions"}],'
+            '"subgroups":[{"name":"short label","main_subject":"principal subject or photographic purpose",'
+            '"images":["filename.jpg"],"representative":"filename.jpg","reason":"why these photographs compete '
+            'for one best-frame decision and why the representative is strongest"}],"reason":"short overall explanation"}\n\n'
+            "Before responding, verify that every allowed filename has exactly one "
+            "observation, every adjacent pair has exactly one transition in input order, "
+            "and every allowed filename appears in exactly one subgroup. Non-adjacent "
+            "photographs may share a subgroup when they are genuinely interchangeable. "
+            "Verify that no unknown filename appears, every subgroup is non-empty, every "
+            "representative belongs to its subgroup, and every transition agrees with "
+            "the subgroup membership of its adjacent pair."
+        )
 
     def _build_subgroup_prompt_for_images(self, images: list[ImageRecord], context_name: str) -> str:
         filenames = "\n".join(f"{index + 1}. {image.filename}" for index, image in enumerate(images))

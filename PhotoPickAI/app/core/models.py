@@ -18,6 +18,7 @@ class ImageRecord:
     height: int
     orientation: str
     capture_time: str
+    capture_time_source: str = "metadata"
     preview_path: str = ""
     phash: str = ""
     sharpness_score: float = 0.0
@@ -29,10 +30,11 @@ class ImageRecord:
 
     @property
     def capture_datetime(self) -> datetime:
-        """Return parsed capture time, or minimum datetime for invalid data."""
+        """Return a comparable local wall-clock capture time."""
 
         try:
-            return datetime.fromisoformat(self.capture_time)
+            parsed = datetime.fromisoformat(self.capture_time.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None)
         except ValueError:
             return datetime.min
 

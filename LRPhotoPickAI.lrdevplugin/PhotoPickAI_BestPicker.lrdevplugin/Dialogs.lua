@@ -23,7 +23,7 @@ local function addIds(target, ids, seen)
     end
 end
 
-local function groupSummary(group, photoById)
+local function groupSummary(group, photoById, maxPhotos)
     local lines = {}
     local groupName = group.group_id or "group"
     local allPhotoIds = {}
@@ -40,8 +40,13 @@ local function groupSummary(group, photoById)
     table.insert(lines, groupName)
     table.insert(lines, "Picked: " .. table.concat(pickedNames, ", "))
     table.insert(lines, "Photos:")
-    for _, photoId in ipairs(allPhotoIds) do
+    local shown = math.min(#allPhotoIds, maxPhotos or #allPhotoIds)
+    for index = 1, shown do
+        local photoId = allPhotoIds[index]
         table.insert(lines, "  " .. displayName(photoId, photoById[photoId]))
+    end
+    if shown < #allPhotoIds then
+        table.insert(lines, "  ... " .. tostring(#allPhotoIds - shown) .. " more photo(s)")
     end
     return table.concat(lines, "\n")
 end
@@ -58,12 +63,21 @@ function Dialogs.error(title, message)
     LrDialogs.message(title, message, "critical")
 end
 
-function Dialogs.summary(result, photoById, dryRun)
+function Dialogs.summary(result, photoById, dryRun, jobFolder)
     local picked = {}
     local rejected = {}
     local lines = {}
-    for _, group in ipairs(result.groups or {}) do
-        table.insert(lines, groupSummary(group, photoById))
+    local groups = result.groups or {}
+    local totalPhotos = 0
+    for _, group in ipairs(groups) do
+        totalPhotos = totalPhotos + #(group.photos or {})
+    end
+    local compact = #groups > 50 or totalPhotos > 200
+    local groupsToShow = compact and math.min(#groups, 20) or #groups
+    for index, group in ipairs(groups) do
+        if index <= groupsToShow then
+            table.insert(lines, groupSummary(group, photoById, compact and 20 or nil))
+        end
         for _, photoId in ipairs(group.representatives or {}) do
             local entry = photoById[photoId]
             table.insert(picked, displayName(photoId, entry))
@@ -77,15 +91,20 @@ function Dialogs.summary(result, photoById, dryRun)
     local title = dryRun and "PhotoPickAI Dry Run - No Flags Changed" or "PhotoPickAI Finished"
     local pickedLabel = dryRun and "Proposed picked" or "Picked flags applied"
     local rejectedLabel = dryRun and "Proposed rejected" or "Rejected flags applied"
+    if compact then
+        table.insert(lines, "... " .. tostring(#groups - groupsToShow) .. " more group(s) in the saved result")
+    end
+    local reportPath = jobFolder and (jobFolder .. "\\completed_result.json") or ""
     local body = string.format(
-        "Groups: %d\n%s: %d\n%s: %d\nSkipped: %d\nErrors: %d\n\nGroups:\n%s",
-        #(result.groups or {}),
+        "Groups: %d\n%s: %d\n%s: %d\nSkipped: %d\nErrors: %d%s\n\nGroups:\n%s",
+        #groups,
         pickedLabel,
         #picked,
         rejectedLabel,
         #rejected,
         #(result.skipped or {}),
         #(result.errors or {}),
+        reportPath ~= "" and ("\nFull result: " .. reportPath) or "",
         table.concat(lines, "\n\n")
     )
     LrDialogs.message(title, body, "info")

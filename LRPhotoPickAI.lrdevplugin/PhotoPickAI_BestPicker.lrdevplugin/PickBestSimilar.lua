@@ -18,22 +18,33 @@ local function safeString(value)
 end
 
 local function getFormattedMetadata(photo, key)
-    local ok, value = pcall(function() return photo:getFormattedMetadata(key) end)
-    if ok then return value end
-    return nil
+    return photo:getFormattedMetadata(key)
 end
 
 local function getRawMetadata(photo, key)
-    local ok, value = pcall(function() return photo:getRawMetadata(key) end)
-    if ok then return value end
-    return nil
+    return photo:getRawMetadata(key)
 end
 
-local function currentPickStatus(photo)
-    local value = getRawMetadata(photo, "pickStatus")
-    if value == 1 then return "picked" end
-    if value == -1 then return "rejected" end
-    return "unflagged"
+local function captureTime(photo)
+    for _, key in ipairs({ "dateTimeOriginalISO8601", "dateTimeISO8601" }) do
+        local value = getRawMetadata(photo, key)
+        if value ~= nil and value ~= "" then
+            return safeString(value)
+        end
+    end
+
+    local numericValue = getRawMetadata(photo, "dateTimeOriginal")
+        or getRawMetadata(photo, "dateTime")
+    if type(numericValue) == "number" then
+        local ok, value = pcall(function()
+            return LrDate.timeToW3CDate(numericValue)
+        end)
+        if ok and value then
+            return safeString(value)
+        end
+        Logger.log("Unable to convert numeric Lightroom capture time: " .. safeString(value))
+    end
+    return ""
 end
 
 local function makeJobFolder(root)
@@ -46,7 +57,6 @@ end
 
 local function buildManifest(jobId, photos, exported, skipped, settings)
     local photoList = {}
-    local photoById = {}
     for _, photo in ipairs(photos) do
         local exportInfo = exported[photo]
         if exportInfo then
@@ -66,26 +76,18 @@ local function buildManifest(jobId, photos, exported, skipped, settings)
             if filename == "" then
                 filename = exportInfo.preview_filename
             end
+            local captureTimeValue = captureTime(photo)
+            if captureTimeValue == "" then
+                Logger.log("Capture time unavailable for " .. filename .. "; server will inspect preview EXIF.")
+            end
             local entry = {
                 photo_id = exportInfo.photo_id,
-                original_path = safeString(path),
+                catalog_uuid = safeString(getRawMetadata(photo, "uuid")),
                 filename = filename,
-                capture_time = safeString(getRawMetadata(photo, "dateTimeOriginal")),
-                rating = getRawMetadata(photo, "rating") or 0,
-                color_label = safeString(getRawMetadata(photo, "colorNameForLabel") or getFormattedMetadata(photo, "label")),
-                current_pick_status = currentPickStatus(photo),
+                capture_time = captureTimeValue,
                 preview_filename = exportInfo.preview_filename,
-                exif = {
-                    iso = getRawMetadata(photo, "isoSpeedRating"),
-                    shutter_speed = safeString(getFormattedMetadata(photo, "shutterSpeed")),
-                    aperture = safeString(getFormattedMetadata(photo, "aperture")),
-                    focal_length = safeString(getFormattedMetadata(photo, "focalLength")),
-                    camera = safeString(getFormattedMetadata(photo, "cameraModel")),
-                    lens = safeString(getFormattedMetadata(photo, "lens")),
-                },
             }
             table.insert(photoList, entry)
-            photoById[entry.photo_id] = { photo = photo, filename = filename, preview_filename = exportInfo.preview_filename }
         end
     end
     return {
@@ -94,70 +96,10 @@ local function buildManifest(jobId, photos, exported, skipped, settings)
         job_id = jobId,
         settings = {
             preview_long_edge = settings.preview_long_edge,
-            auto_reject_non_selected = settings.auto_reject_non_selected,
         },
         photos = photoList,
         skipped = skipped,
-    }, photoById
-end
-
-local function validateResult(result, photoById)
-    if type(result) ~= "table" or result.status ~= "completed" or type(result.groups) ~= "table" then
-        return false, "Server result was not completed or had no groups list."
-    end
-    local anyRepresentative = false
-    for _, group in ipairs(result.groups) do
-        local reps = group.representatives or {}
-        local rejected = group.rejected or {}
-        local rejectedSet = {}
-        if #reps == 0 then
-            Logger.log("Group has no representative: " .. safeString(group.group_id))
-        end
-        for _, photoId in ipairs(rejected) do
-            if not photoById[photoId] then
-                return false, "Server returned rejected photo_id not in selection: " .. safeString(photoId)
-            end
-            rejectedSet[photoId] = true
-        end
-        for _, photoId in ipairs(reps) do
-            if not photoById[photoId] then
-                return false, "Server returned representative photo_id not in selection: " .. safeString(photoId)
-            end
-            if rejectedSet[photoId] then
-                return false, "Server returned a photo as both representative and rejected: " .. safeString(photoId)
-            end
-            anyRepresentative = true
-        end
-    end
-    if not anyRepresentative then
-        return false, "Server result did not contain any representative photos."
-    end
-    return true, "ok"
-end
-
-local function applyFlags(catalog, result, photoById, settings)
-    catalog:withWriteAccessDo("PhotoPickAI Best Similar Picker", function()
-        for _, group in ipairs(result.groups or {}) do
-            for _, photoId in ipairs(group.representatives or {}) do
-                local entry = photoById[photoId]
-                if entry then
-                    Logger.log("Before pick " .. photoId .. " " .. currentPickStatus(entry.photo))
-                    entry.photo:setRawMetadata("pickStatus", 1)
-                    Logger.log("After pick " .. photoId)
-                end
-            end
-            if settings.auto_reject_non_selected then
-                for _, photoId in ipairs(group.rejected or {}) do
-                    local entry = photoById[photoId]
-                    if entry then
-                        Logger.log("Before reject " .. photoId .. " " .. currentPickStatus(entry.photo))
-                        entry.photo:setRawMetadata("pickStatus", -1)
-                        Logger.log("After reject " .. photoId)
-                    end
-                end
-            end
-        end
-    end)
+    }
 end
 
 LrTasks.startAsyncTask(function()
@@ -166,6 +108,19 @@ LrTasks.startAsyncTask(function()
     Logger.init(settings.temp_job_root)
     local catalog = LrApplication.activeCatalog()
     local photos = catalog:getTargetPhotos()
+    local activeJobPath = LrPathUtils.child(settings.temp_job_root, "active_job.json")
+
+    if LrFileUtils.exists(activeJobPath) then
+        local activeOk, activeJob = pcall(function() return Json.readFile(activeJobPath) end)
+        if activeOk and type(activeJob) == "table" and not activeJob.applied and not activeJob.closed then
+            Dialogs.warning(
+                "PhotoPickAI Job Pending",
+                "Job " .. safeString(activeJob.job_id)
+                    .. " has not been applied yet. Use 'PhotoPickAI: Check Job Status / Apply Results' before submitting another job."
+            )
+            return
+        end
+    end
 
     if #photos < settings.min_selected_photos then
         Dialogs.warning("PhotoPickAI", "Select at least " .. tostring(settings.min_selected_photos) .. " photos.")
@@ -202,7 +157,7 @@ LrTasks.startAsyncTask(function()
 
     progressScope:setCaption("Writing PhotoPickAI job manifest...")
     progressScope:setPortionComplete(45, 100)
-    local manifest, photoById = buildManifest(jobId, photos, exported, skipped, settings)
+    local manifest = buildManifest(jobId, photos, exported, skipped, settings)
     Json.writeFile(jobJson, manifest)
     Logger.log("Wrote manifest " .. jobJson .. " photos=" .. tostring(#manifest.photos))
 
@@ -212,10 +167,10 @@ LrTasks.startAsyncTask(function()
         return
     end
 
-    progressScope:setCaption("Sending previews to PhotoPickAI server and waiting for review...")
+    progressScope:setCaption("Uploading previews and starting PhotoPickAI job...")
     progressScope:setPortionComplete(55, 100)
-    Logger.log("Helper command " .. HttpClient.buildCommand(settings, jobJson, previewFolder, resultJson))
-    local exitCode = HttpClient.runHelper(settings, jobJson, previewFolder, resultJson)
+    Logger.log("Helper command " .. HttpClient.buildCommand(settings, jobJson, previewFolder, resultJson, "submit"))
+    local exitCode = HttpClient.runHelper(settings, jobJson, previewFolder, resultJson, "submit")
     Logger.log("Helper exit code " .. tostring(exitCode))
     if exitCode ~= 0 then
         progressScope:done()
@@ -226,39 +181,40 @@ LrTasks.startAsyncTask(function()
         return
     end
 
-    progressScope:setCaption("Reading PhotoPickAI result...")
-    progressScope:setPortionComplete(85, 100)
-    local ok, result = pcall(function() return Json.readFile(resultJson) end)
-    if not ok then
-        Logger.log("Invalid result JSON: " .. tostring(result))
-        progressScope:done()
-        Dialogs.error("PhotoPickAI Invalid Result", "Could not read server result JSON. No flags were changed.")
-        return
-    end
-
-    progressScope:setCaption("Validating PhotoPickAI decisions...")
+    progressScope:setCaption("Recording PhotoPickAI job...")
     progressScope:setPortionComplete(90, 100)
-    local valid, message = validateResult(result, photoById)
-    Logger.log("Validation " .. tostring(valid) .. " " .. message)
-    if not valid then
+    local ok, response = pcall(function() return Json.readFile(resultJson) end)
+    if not ok then
+        Logger.log("Invalid submission response JSON: " .. tostring(response))
         progressScope:done()
-        Dialogs.error("PhotoPickAI Invalid Result", message .. "\nNo flags were changed.")
+        Dialogs.error("PhotoPickAI Invalid Response", "Could not read the server submission response. No flags were changed.")
         return
     end
 
-    if settings.dry_run then
-        progressScope:setCaption("PhotoPickAI dry run complete.")
-        progressScope:setPortionComplete(100, 100)
+    if type(response) ~= "table" or not response.job_id or not response.status then
         progressScope:done()
-        Dialogs.summary(result, photoById, true)
+        Dialogs.error("PhotoPickAI Invalid Response", "The server did not return a job ID and status. No flags were changed.")
         return
     end
 
-    progressScope:setCaption("Applying Lightroom pick/reject flags...")
-    progressScope:setPortionComplete(95, 100)
-    applyFlags(catalog, result, photoById, settings)
-    progressScope:setCaption("PhotoPickAI finished.")
+    Json.writeFile(activeJobPath, {
+        schema_version = 1,
+        job_id = response.job_id,
+        job_folder = jobFolder,
+        catalog_path = safeString(catalog:getPath()),
+        server_url = settings.server_url,
+        dry_run = settings.dry_run,
+        auto_reject_non_selected = settings.auto_reject_non_selected,
+        applied = false,
+        submitted_at = os.time(),
+    })
+    Logger.log("Recorded active job " .. safeString(response.job_id) .. " at " .. activeJobPath)
+    progressScope:setCaption("PhotoPickAI job submitted.")
     progressScope:setPortionComplete(100, 100)
     progressScope:done()
-    Dialogs.summary(result, photoById, false)
+    Dialogs.info(
+        "PhotoPickAI Job Submitted",
+        "Job " .. safeString(response.job_id) .. " is processing on the server.\n\n"
+            .. "Use 'PhotoPickAI: Check Job Status / Apply Results' later."
+    )
 end)

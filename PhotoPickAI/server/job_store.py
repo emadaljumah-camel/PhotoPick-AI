@@ -164,7 +164,32 @@ class JobStore:
     def save_result(self, result: JobResult) -> None:
         validated = self.validate_completed_result(result)
         self.write_json(validated.job_id, "result.json", validated.model_dump())
-        self.set_status(validated.job_id, validated.status, Progress(stage=validated.status), errors=[], resumable=False)
+        self.set_status(
+            validated.job_id,
+            validated.status,
+            self._completed_progress(validated.job_id),
+            errors=[],
+            resumable=False,
+        )
+
+    def _completed_progress(self, job_id: str) -> Progress:
+        saved_groups = self.load_groups(job_id)
+        if saved_groups is not None:
+            total_groups = len(saved_groups[0])
+        else:
+            previous = Progress.model_validate(
+                self.get_status(job_id).get("progress", {})
+            )
+            total_groups = max(
+                previous.processed_groups,
+                previous.total_groups,
+            )
+        return Progress(
+            stage="completed",
+            processed_groups=total_groups,
+            total_groups=total_groups,
+            current_group_id=None,
+        )
 
     def get_result(self, job_id: str) -> dict:
         return self.read_json(job_id, "result.json")
@@ -272,6 +297,37 @@ class JobStore:
         payload = self.read_json(job_id, "groups.json")
         return [PhotoGroup.model_validate(item) for item in payload.get("groups", [])], list(payload.get("skipped", []))
 
+    def load_semantic_diagnostics(self, job_id: str) -> dict[str, Any]:
+        path = self.job_dir(job_id) / "semantic_diagnostics.json"
+        if not path.exists():
+            return {}
+        payload = self.read_json(job_id, "semantic_diagnostics.json")
+        groups = payload.get("broad_groups", {})
+        return groups if isinstance(groups, dict) else {}
+
+    def save_semantic_diagnostic(
+        self,
+        job_id: str,
+        broad_group_id: str,
+        diagnostic: dict[str, Any],
+    ) -> None:
+        path = self.job_dir(job_id) / "semantic_diagnostics.json"
+        try:
+            payload = self.read_json(job_id, "semantic_diagnostics.json") if path.exists() else {}
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        now = utc_now()
+        if not isinstance(payload.get("broad_groups"), dict):
+            payload = {
+                "schema_version": 1,
+                "job_id": job_id,
+                "broad_groups": {},
+                "created_at": now,
+            }
+        payload["broad_groups"][broad_group_id] = diagnostic
+        payload["updated_at"] = now
+        self.write_json(job_id, "semantic_diagnostics.json", payload)
+
     def load_checkpoint(
         self,
         job_id: str,
@@ -366,7 +422,13 @@ class JobStore:
                         except (OSError, TypeError, ValueError, json.JSONDecodeError):
                             pass
                         else:
-                            self.set_status(job_dir.name, "completed", Progress(stage="completed"), errors=[], resumable=False)
+                            self.set_status(
+                                job_dir.name,
+                                "completed",
+                                self._completed_progress(job_dir.name),
+                                errors=[],
+                                resumable=False,
+                            )
                             continue
                     self.set_status(
                         job_dir.name,
