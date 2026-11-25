@@ -1,163 +1,188 @@
-# PhotoPickAI Lightroom Server Integration
+# Lightroom, Python helper, and server
 
-This adds a Lightroom Classic client workflow without changing the existing PhotoPickAI desktop app.
+This mode compares Lightroom-exported previews and applies Pick/Rejected flags.
+It does **not** invoke the desktop app's file mover. See the
+[root overview](../README.md) and [architecture](../docs/ARCHITECTURE.md).
 
-## Pieces
+## Server setup
 
-- Lightroom plugin source: `D:\Projects\PhotoPick-AI\LRPhotoPickAI.lrdevplugin\PhotoPickAI_BestPicker.lrdevplugin`
-- Lightroom deployment package: `D:\Projects\PhotoPick-AI\dist\PhotoPickAI_BestPicker.lrdevplugin.zip`
-- Bundled Lightroom helper: `PhotoPickAI_BestPicker.lrdevplugin\helper\lr_client_helper.py`
-- Server: `D:\Projects\PhotoPick-AI\PhotoPickAI\server`
-- Source client helper: `D:\Projects\PhotoPick-AI\PhotoPickAI\client_helper\lr_client_helper.py`
-- Config: `D:\Projects\PhotoPick-AI\PhotoPickAI\photopickai_server_config.yaml`
-
-The Lightroom plugin exports resized JPEG previews, submits the job, and immediately returns after the server queues it. Use `PhotoPickAI: Check Job Status / Apply Results` later to inspect progress, resume an interrupted job, or validate and apply a completed result.
-
-Preview files are named from the original Lightroom filename when Lightroom exposes it. For example, `DSC_1234.NEF` is exported as `DSC_1234.jpg` for server review. The original filename is also written to `job.json` and used in the Lightroom summary dialog.
-
-## Resumable Jobs
-
-Long Lightroom jobs are checkpointed on both the Lightroom computer and the server. Lightroom does not remain blocked while Vision processing runs. If Lightroom closes, the network disconnects, or the server restarts, completed work is retained.
-
-To resume:
-
-1. Restart the PhotoPickAI server if it is not running.
-2. Open the original Lightroom catalog.
-3. Run `PhotoPickAI: Check Job Status / Apply Results`.
-4. Choose `Resume Job` when Lightroom reports an interrupted or resumable failure.
-
-The helper calculates a fingerprint of the selection, processing settings, and preview SHA-256 hashes. Photo order does not affect the fingerprint. It stores the server job ID in `job_state.json` inside the local job folder and in `.resume/<fingerprint>.json` under the configured Lightroom temporary-job root. Incomplete submissions reconnect to the earlier server job, compare server and local hashes, upload only missing or mismatched previews, and safely call the idempotent run endpoint. A deliberate submission after a completed job creates a fresh job so model or prompt changes can produce a new decision.
-
-Do not delete the Lightroom temporary-job root or `server/jobs/<job-id>` while a job may need recovery. Downloaded completions are also preserved locally as `completed_result.json`, allowing Lightroom to retry flag application without rerunning Vision.
-
-The server job directory contains:
-
-```text
-server/jobs/<job-id>/
-  job.json          immutable request, fingerprint, and creation time
-  status.json       stage, progress, errors, timestamps, and resumability
-  previews/         uploaded JPEG previews
-  groups.json       persisted similarity groups
-  checkpoint.json   completed Vision decisions keyed by review-group ID
-  result.json       validated complete result only
-```
-
-JSON files and previews are committed with a temporary-file, flush, `fsync`, and atomic replace sequence. After an interruption, grouping is reused when `groups.json` exists and every group present in `checkpoint.json` is skipped. Only the group active at the moment of failure may run again.
-
-When the server starts, stale active jobs are changed to `interrupted` with `resumable: true`. They are resumed when the helper calls the run endpoint again; the server does not automatically start them without a client request.
-
-## Server Setup
-
-From `D:\Projects\PhotoPick-AI\PhotoPickAI`:
+From the repository root:
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m pip install -r server\requirements.txt
-uvicorn server.main:app --host 0.0.0.0 --port 8000
+cd PhotoPickAI
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r server\requirements.txt
 ```
 
-Health check:
+For an existing environment, preserve installed versions and review any
+dependency changes separately.
+
+Create or edit the ignored local `photopickai_server_config.yaml` in this
+directory. Do not overwrite an existing configuration. Minimal example:
+
+```yaml
+server:
+  host: "127.0.0.1"
+  port: 8000
+model:
+  provider: "lmstudio"
+  base_url: "http://127.0.0.1:1234/v1"
+  model_name: "YOUR-EXACT-LOADED-VISION-MODEL-ID"
+  timeout_seconds: 180
+storage:
+  keep_jobs_days: 7
+```
+
+Replace the model placeholder with your runtime's exact loaded image-capable ID.
+The current server adapter appends `/chat/completions` to `base_url`. The
+desktop reviewer's Ollama endpoint support does not establish interchangeable
+server provider behavior.
+
+`server/config.py` reads this fixed YAML path. There is no generic `.env` loader
+or external-config environment selector. `PHOTOPICKAI_API_KEY` specifically
+overrides the YAML server key, including when the environment value is empty.
+Other settings come from YAML/defaults. Relative `jobs_dir` overrides use normal
+working-directory resolution; the built-in job root is `server/jobs/` here.
+
+The `keep_jobs_days` setting is read but no automatic expiration/cleanup is
+implemented. Do not assume jobs are deleted after seven days.
+
+## Bind and authentication
+
+From `PhotoPickAI`:
 
 ```powershell
-curl http://100.108.139.62:8080/photopick/health
+.\.venv\Scripts\python.exe -m uvicorn server.main:app --host 127.0.0.1 --port 8000
 ```
 
-## Lightroom Setup
+The provided `run_server.bat` explicitly binds all interfaces on port 8000,
+regardless of a loopback host value in YAML. Use explicit command-line bind
+values to control network exposure.
 
-1. Open Lightroom Classic.
-2. Go to `File > Plug-in Manager`.
-3. Add `D:\Projects\PhotoPick-AI\LRPhotoPickAI.lrdevplugin\PhotoPickAI_BestPicker.lrdevplugin` for development, or unzip `dist\PhotoPickAI_BestPicker.lrdevplugin.zip` and add the unzipped `PhotoPickAI_BestPicker.lrdevplugin` folder for deployment.
-4. Set `Server URL` to `http://localhost:8080/photopick` for the installed local service, or enter the remote server URL used by your deployment.
-5. Run `Library > Plug-in Extras > PhotoPickAI: Submit Selected Photos`.
-6. Later, run `PhotoPickAI: Check Job Status / Apply Results`.
+Check `http://127.0.0.1:8000/health`. It reports process availability, not model
+readiness. With a configured nonempty key, protected job requests require the
+`X-PhotoPickAI-Key` header. Set the same key in the plug-in. Health remains
+public. Empty key means authentication is bypassed.
 
-Defaults are stored with Lightroom plugin preferences. New installs use 1024-pixel JPEG previews at quality 85. Dry run is disabled by default.
-
-Fresh installs default to `http://localhost:8080/photopick` and the helper script bundled inside the `.lrdevplugin` folder. Existing Lightroom preferences are preserved until `Reset to Default Values` is clicked.
-
-## Network Setup
-
-On the AI workstation:
+For example, set a secret in the launching environment before starting Uvicorn:
 
 ```powershell
-uvicorn server.main:app --host 0.0.0.0 --port 8000
+$env:PHOTOPICKAI_API_KEY = "YOUR-PRIVATE-KEY"
 ```
 
-On the Lightroom computer, set the plugin `Server URL` preference to:
+The placeholder is not a secure generated key. Keep real values out of tracked
+files and shared console captures. There is no built-in TLS or user-level
+authorization.
 
-```text
-http://100.108.139.62:8080/photopick
+## Helper and plug-in
+
+1. On the Lightroom computer, install a supported Python interpreter.
+2. Add the complete
+   [PhotoPickAI_BestPicker.lrdevplugin](../LRPhotoPickAI.lrdevplugin/PhotoPickAI_BestPicker.lrdevplugin/)
+   folder in **File > Plug-in Manager**.
+3. Select **03 PhotoPickAI Best Similar Picker** and configure its preferences.
+4. Set Server URL to `http://127.0.0.1:8000` for a direct local server. The initial
+   `http://localhost:8080/photopick` is an external proxy example, not a server
+   started by this repository.
+5. Configure Helper Python to an executable available on this computer. It
+   defaults to `python`, which depends on PATH.
+6. Keep the helper script pointing to the bundled `helper/lr_client_helper.py`.
+   [Helper requirements](../LRPhotoPickAI.lrdevplugin/PhotoPickAI_BestPicker.lrdevplugin/helper/requirements.txt)
+   describe its separate dependency expectations.
+7. Match the optional API key and choose a persistent temporary-job root if
+   OS temporary-folder cleanup would endanger needed recovery files.
+8. Enable dry-run for the first test.
+
+The default preview long edge is 1024 pixels, JPEG quality 85, minimum selected
+count 2, and timeout 120 seconds. Dry-run defaults off; automatic rejection of
+non-selected photos defaults on. Saved preferences are retained until reset.
+
+The helper is launched as a local Python process. It submits/checks/resumes HTTP
+jobs on Lightroom's behalf. Both its executable and bundled script must be
+accessible on the Lightroom computer, independently of the remote AI server.
+
+## First pair walkthrough
+
+1. In a disposable/backed-up catalog, select at least two similar test photos.
+2. Run **Library > Plug-in Extras > PhotoPickAI: Submit Selected Photos**.
+3. Wait for successful queued acknowledgment. Submission does not change flags.
+4. Keep the server/model running; Lightroom may disconnect after acknowledgment.
+5. Reconnect and run **PhotoPickAI: Check Job Status / Apply Results**.
+6. Running jobs report progress; interrupted/resumable failures offer Resume Job.
+7. Completed results are validated and processed using the saved dry-run choice.
+   A dry-run shows results without changing flags.
+8. For real flags, submit a new job with dry-run disabled; inspect the resulting
+   representatives (Pick) and, if enabled, rejected alternatives (Rejected).
+
+There is no separate per-photo approval screen before flag application. Existing
+flags can be overwritten; no existing-Pick protection switch is implemented.
+Unlisted/ungrouped/skipped photos are not deliberately assigned arbitrary
+verdicts by the application loop.
+
+## Jobs and API
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET | `/health` | Public process health |
+| POST | `/jobs` | Create/reuse request using client fingerprint |
+| POST | `/jobs/{job_id}/photos/{photo_id}/preview` | Multipart preview file, validated against request hash |
+| GET | `/jobs/{job_id}/uploads` | Acknowledged preview names/hashes |
+| POST | `/jobs/{job_id}/run` | Queue/resume `group_and_pick` processing |
+| GET | `/jobs/{job_id}/status` | Progress, errors, resumability |
+| GET | `/jobs/{job_id}/result` | Validated completion or current state |
+
+There is no server cancel/delete endpoint. Use one Uvicorn process with the
+filesystem store. The app declares `root_path="/photopick"` for proxy metadata;
+a proxy base path must be stripped before forwarding. Direct clients use the
+routes above without that prefix.
+
+Helper fingerprints include selection/settings/preview hashes and do not
+depend on photo order. Incomplete work can recover its server identity and
+upload only needed previews. A deliberate submission after completion creates
+a fresh review, allowing changed prompts/models to produce new results.
+
+Server checkpoints persist grouping and completed group decisions. Startup
+marks stale running jobs interrupted; resume reuses completed groups. Results
+are cached locally for flag-application retry. One active client pointer tracks
+the current catalog/job.
+
+## Recovery and limitations
+
+Do not delete the local temporary-job root or backend job directory while
+recovery is needed. Local state includes `job_state.json`,
+`.resume/<fingerprint>.json`, active state, and cached `completed_result.json`.
+A missing/non-resumable job can require a deliberate fresh submission.
+
+Catalog identity, photo resolution, membership, and result validity are checked
+before flags are applied. The completion marker is saved afterward, not in one
+atomic transaction with the catalog. There is no per-photo original-flag
+snapshot or automatic flag rollback. Inspect potentially changed photos before
+retry; use appropriate Lightroom Undo/catalog backups for recovery.
+
+Closing a local failed job does not cancel already-running backend work.
+Stopping the process interrupts execution, not reverses decisions or catalog
+changes. Retained originals are not moved or deleted by this integration.
+
+## Two computers and privacy
+
+Use the server's reachable private address instead of loopback on the Lightroom
+computer, deliberately bind a reachable server interface, and restrict firewall
+access. Configure the same nonempty API key. Transport still needs protection:
+keys are not encryption, and job access is not isolated by user.
+
+Previews, EXIF/context, original names/paths, API-key preferences, and diagnostics
+can be sensitive. See [SECURITY.md](../SECURITY.md) before exposing a service or
+sharing job folders.
+
+## Tests
+
+From `PhotoPickAI`:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -q
 ```
 
-Open firewall access for the deployed server port on the AI workstation. For the deployment URL above, that is TCP port `8080`.
-
-## API Key
-
-Set `server.api_key` in `photopickai_server_config.yaml`, or set environment variable `PHOTOPICKAI_API_KEY`.
-
-The Lightroom helper sends:
-
-```text
-X-PhotoPickAI-Key: configured-key
-```
-
-If the server key is empty, requests are allowed.
-
-## Job API Resume Behavior
-
-- `POST /jobs` creates a job or reuses it when the supplied `job_id` and immutable request fingerprint match. Reusing the ID with different input returns HTTP `409 Conflict`.
-- `GET /jobs/{job_id}/uploads` returns `uploaded_photo_ids` and `uploaded_preview_sha256` so clients skip only previews whose content already matches.
-- `POST /jobs/{job_id}/photos/{photo_id}/preview` is repeatable. Identical content is reused. Changed content may be atomically replaced while the job is still in `created`; after processing starts it returns HTTP `409 Conflict` so grouping and checkpoints cannot become stale.
-- `POST /jobs/{job_id}/run` queues a created, failed, or interrupted job once. Duplicate calls while it is active do not create another worker. For a completed job it returns the existing result.
-- `GET /jobs/{job_id}/status` includes `status`, `progress`, `errors`, `resumable`, `created_at`, `updated_at`, `started_at`, and `completed_at`.
-- `GET /jobs/{job_id}/result` retains the existing response shape used by the Lightroom helper.
-
-Duplicate-worker locking is process-local. Run this JSON-checkpoint implementation with one Uvicorn worker. A future multi-process deployment will require a cross-process lock or transactional job store.
-
-## Dry Run
-
-Dry run does not change Lightroom flags. It shows the same group summary that a normal run would show, but no Lightroom pick/reject flags are changed. Turn `dry_run` off only after confirming the server result looks right.
-
-## Lightroom Summary
-
-After validation, Lightroom shows a summary dialog with counts and group membership. For large jobs, the dialog shows the first 20 groups and first 20 photos per displayed group; `completed_result.json` retains the complete report. The summary does not include AI reasons or confidence scores.
-
-Example:
-
-```text
-Groups: 1
-Picked flags applied: 1
-Rejected flags applied: 1
-Skipped: 0
-Errors: 0
-
-Groups:
-G001_01
-Picked: DSC_1235.NEF
-Photos:
-  DSC_1234.NEF
-  DSC_1235.NEF
-```
-
-The `Picked:` line names the photo selected for that group. The `Photos:` list shows the photos in the group without repeating a picked marker.
-
-## Safety
-
-- Original images are never uploaded.
-- Original files are never modified, moved, deleted, or metadata-written by this integration.
-- The server only receives preview JPEGs.
-- Lightroom only changes catalog pick/reject flags after result validation.
-- Summary filenames come from Lightroom metadata when available; if Lightroom cannot provide an original filename, the plugin falls back to the preview filename.
-
-## Troubleshooting
-
-- Server unreachable: confirm `/health`, IP address, firewall, and `server_url`.
-- Wrong API key: confirm the plugin and server values match.
-- Network timeout: increase `timeout_seconds` if an individual upload or status request cannot complete.
-- Interrupted long job: leave both job directories intact, restart the server if necessary, and use `PhotoPickAI: Check Job Status / Apply Results` to resume it.
-- HTTP 409 when creating a job: the same job ID was reused with a different manifest. Preserve the old job for recovery or start with a genuinely new job ID.
-- Missing preview: Lightroom skipped an export; check `plugin.log` under the temp job root.
-- Generated-looking names in the summary, such as `photo_0001_260.jpg`, mean Lightroom did not expose the original filename for that photo during export/manifest creation. Check the source file path and Lightroom file metadata.
-- Invalid server result: Lightroom refuses to flag anything and logs the validation failure.
-- Server logs: `D:\Projects\PhotoPick-AI\PhotoPickAI\server\logs\server.log`
+The [manual recovery harness](tests/manual_recovery_e2e.py) starts processes and
+uses mocked review for a recovery exercise; it is separate from ordinary unit
+discovery and does not establish actual model or Lightroom behavior.
